@@ -189,8 +189,6 @@ python train.py  # config.yaml 中 wandb.enabled=true 时自动上传
 
 ## config.yaml 配置项速览
 
-所有参数均支持 `//` 行注释，详细说明见文件内注释。
-
 | 节 | 主要参数 |
 |----|---------|
 | `model` | 网络通道数、CBAM 压缩比 |
