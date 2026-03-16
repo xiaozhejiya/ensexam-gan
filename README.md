@@ -205,9 +205,23 @@ python train.py  # config.yaml 中 wandb.enabled=true 时自动上传
 
 ## 致谢
 
-本模块基于 [xiaozhejiya/error_correction](https://github.com/xiaozhejiya/error_correction/tree/feature/classify_model) 的 `feature/classify_model` 分支独立而来，感谢该分支的工作为本模块奠定了基础。
+### 模型原始作者
 
-数据集来自华南理工大学人机交互研究室：
+本模块的核心模型代码（网络结构、损失函数、训练流程）由 **ADchampion3**在 [xiaozhejiya/error_correction](https://github.com/xiaozhejiya/error_correction) 仓库的 `feature/classify_model` 分支上完成，主要贡献包括：
+
+- 上传模型初步代码（commit `6010999`）
+- 修改模型结构（commit `831b752`）
+- 移除 `Mb_UpSampleBlock`（commit `b5729a0`）
+- 修改 soft mask 实现（commit `2a87b8c`）
+
+本仓库在上述工作的基础上，补充了数据集加载、数据增强、训练日志、早停、W&B 监控、Reptile 元训练以及 Optuna 超参数调优等工程化模块，并将原始分支独立为单独仓库。
+
+> 原始分支地址：
+> https://github.com/xiaozhejiya/error_correction/tree/feature/classify_model
+
+### 数据集
+
+数据集来自华南理工大学人机交互研究室（SCUT-HCCLab）：
 
 > Lianwen Jin et al., "SCUT-EnsExam: A Benchmark Dataset for Handwritten Text Erasure on Examination Papers," *Pattern Recognition*, 2022.
-> [[GitHub]](https://github.com/HCIILAB/SCUT-EnsExam)
+> [[GitHub]](https://github.com/HCIILAB/SCUT-EnsExam)](https://github.com/HCIILAB/SCUT-EnsExam)
