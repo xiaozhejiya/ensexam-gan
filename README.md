@@ -224,4 +224,4 @@ python train.py  # config.yaml 中 wandb.enabled=true 时自动上传
 数据集来自华南理工大学人机交互研究室（SCUT-HCCLab）：
 
 > Lianwen Jin et al., "SCUT-EnsExam: A Benchmark Dataset for Handwritten Text Erasure on Examination Papers," *Pattern Recognition*, 2022.
-> [[GitHub]](https://github.com/HCIILAB/SCUT-EnsExam)](https://github.com/HCIILAB/SCUT-EnsExam)
+> [[GitHub]]([https://github.com/HCIILAB/SCUT-EnsExam](https://github.com/SCUT-DLVCLab/SCUT-EnsExam))]([https://github.com/HCIILAB/SCUT-EnsExam](https://github.com/SCUT-DLVCLab/SCUT-EnsExam))
