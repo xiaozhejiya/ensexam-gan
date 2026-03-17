@@ -3,11 +3,11 @@ Reptile 元训练入口：学习对所有试卷笔迹风格都泛化的初始参
 
 用法:
     python meta_train.py                     # 使用默认 config.yaml
-    python meta_train.py --config my.json
+    python meta_train.py --config my.yaml
 
 完成后在 config.yaml 中设置：
-    "resume": true,
-    "resume_path": "./reptile_checkpoints/reptile_meta_init.pth"
+    resume: true
+    resume_path: ./reptile_checkpoints/reptile_meta_init.pth
 再运行 python train.py 进行二次训练。
 """
 import argparse

@@ -82,7 +82,10 @@ pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 \
 
 # 其余依赖
 pip install opencv-python Pillow numpy albumentations tqdm \
-    learn2learn optuna optuna-dashboard wandb
+    optuna optuna-dashboard wandb PyYAML
+
+# 或直接使用 requirements.txt
+pip install -r requirements.txt
 ```
 
 ---
@@ -94,19 +97,20 @@ pip install opencv-python Pillow numpy albumentations tqdm \
 ```
 data_root/
 ├── train/
-│   ├── all_images/     # 带笔记的原始试卷
-│   └── all_labels/     # 擦除后的干净底图（同名文件）
+│   ├── all_images/      # 带笔记的原始试卷
+│   ├── all_labels/      # 擦除后的干净底图（同名文件）
+│   └── box_label_txt/   # 文本块四边形标注（同名 .txt，用于精确 Mb）
 └── test/
     ├── all_images/
-    └── all_labels/
+    ├── all_labels/
+    └── box_label_txt/
 ```
 
 在 `config.yaml` 中设置路径：
 
-```json
-"data": {
-    "data_root": "/path/to/SCUT-EnsExam"
-}
+```yaml
+data:
+  data_root: /path/to/SCUT-EnsExam
 ```
 
 ---
@@ -150,11 +154,10 @@ python tune.py --resume
 
 修改 `config.yaml`：
 
-```json
-"train": {
-    "resume": true,
-    "resume_path": "./reptile_checkpoints/reptile_meta_init.pth"
-}
+```yaml
+train:
+  resume: true
+  resume_path: ./reptile_checkpoints/reptile_meta_init.pth
 ```
 
 ```bash

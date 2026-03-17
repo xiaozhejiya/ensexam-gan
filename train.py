@@ -3,7 +3,7 @@
 
 用法:
     python train.py                        # 使用默认 config.yaml
-    python train.py --config my_cfg.json   # 使用自定义配置
+    python train.py --config my_cfg.yaml   # 使用自定义配置
 """
 import argparse
 import csv

@@ -4,14 +4,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import vgg16
+from torchvision.models import vgg16, VGG16_Weights
 
 
 class VGG16Feature(nn.Module):
     """冻结的 VGG16 特征提取器，输出三个不同深度的特征层用于感知/风格损失。"""
     def __init__(self):
         super().__init__()
-        vgg = vgg16(pretrained=True).features
+        vgg = vgg16(weights=VGG16_Weights.DEFAULT).features
         self.feat1 = nn.Sequential(*vgg[:5])    # relu1_2
         self.feat2 = nn.Sequential(*vgg[5:10])  # relu2_2
         self.feat3 = nn.Sequential(*vgg[10:17]) # relu3_3

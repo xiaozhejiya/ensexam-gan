@@ -3,7 +3,7 @@
 
 用法:
     python tools/analyze_dataset.py
-    python tools/analyze_dataset.py --config my.json
+    python tools/analyze_dataset.py --config my.yaml
 """
 import argparse
 import os
