@@ -1,6 +1,10 @@
 """
-掩码生成工具：根据原图与擦除 GT 图的像素差异，生成软笔画掩码 Ms 和文本块掩码 Mb。
+掩码生成工具：
+  - Ms（软笔画掩码）：从原图与 GT 的像素差值 + SAF 算法生成
+  - Mb（文本块掩码）：优先使用 box_label_txt 精确标注；无标注时退回像素差值+膨胀
 """
+import os
+
 import cv2
 import numpy as np
 
@@ -71,3 +75,62 @@ def generate_mask_from_pair(Iin: np.ndarray, Igt: np.ndarray,
         return Ms_gt, Mb_gt, debug_info
 
     return Ms_gt, Mb_gt
+
+
+def generate_mb_from_boxes(txt_path: str,
+                            crop_x1: int, crop_y1: int,
+                            crop_x2: int, crop_y2: int,
+                            patch_size: int) -> np.ndarray:
+    """
+    从 box_label_txt 标注文件生成文本块掩码 Mb_gt。
+
+    标注格式（每行）：x1,y1,x2,y2,x3,y3,x4,y4, class
+        四个角点为顺时针或逆时针排列的四边形，坐标为原始完整图像空间。
+
+    Args:
+        txt_path:  对应图像的 box_label_txt 文件路径
+        crop_x1/y1/x2/y2: 当前 patch 在原图中的像素范围
+        patch_size: 输出掩码边长（正方形）
+
+    Returns:
+        Mb_gt: uint8 {0, 1}，shape (patch_size, patch_size)
+    """
+    Mb = np.zeros((patch_size, patch_size), dtype=np.uint8)
+
+    if not os.path.exists(txt_path):
+        return Mb
+
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(',')
+        if len(parts) < 8:
+            continue
+        try:
+            coords = [int(p.strip()) for p in parts[:8]]
+        except ValueError:
+            continue
+
+        # 四个角点 (x, y)
+        pts = np.array(coords, dtype=np.float32).reshape(4, 2)
+
+        # 快速过滤：包围盒与 patch 不相交则跳过
+        bx_min, by_min = pts[:, 0].min(), pts[:, 1].min()
+        bx_max, by_max = pts[:, 0].max(), pts[:, 1].max()
+        if bx_max <= crop_x1 or bx_min >= crop_x2:
+            continue
+        if by_max <= crop_y1 or by_min >= crop_y2:
+            continue
+
+        # 坐标平移到 patch 局部空间，并裁剪到 [0, patch_size-1]
+        pts[:, 0] -= crop_x1
+        pts[:, 1] -= crop_y1
+        pts = np.clip(pts, 0, patch_size - 1).astype(np.int32)
+
+        cv2.fillPoly(Mb, [pts], 1)
+
+    return Mb

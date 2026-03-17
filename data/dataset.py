@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from data.mask_utils import generate_mask_from_pair
+from data.mask_utils import generate_mask_from_pair, generate_mb_from_boxes
 from data.augmentation import get_train_augmentation
 
 
@@ -61,8 +61,10 @@ class EnsExamRealDataset(Dataset):
         ])
 
         split = "train" if is_train else "test"
-        self.img_dir = os.path.join(data_root, split, "all_images")
-        self.gt_dir = os.path.join(data_root, split, "all_labels")
+        self.img_dir  = os.path.join(data_root, split, "all_images")
+        self.gt_dir   = os.path.join(data_root, split, "all_labels")
+        self.box_dir  = os.path.join(data_root, split, "box_label_txt")
+        self.has_boxes = os.path.isdir(self.box_dir)
 
         self.patch_index_map = []
         self._build_patch_index()
@@ -104,9 +106,15 @@ class EnsExamRealDataset(Dataset):
                     if W <= self.img_size:
                         x1, x2 = 0, W
 
+                    # box_label_txt 文件名与图像同名，扩展名改为 .txt
+                    box_txt = os.path.join(
+                        self.box_dir, os.path.splitext(fname)[0] + '.txt'
+                    ) if self.has_boxes else None
+
                     self.patch_index_map.append({
-                        'img_path': img_path,
-                        'gt_path': gt_path,
+                        'img_path':     img_path,
+                        'gt_path':      gt_path,
+                        'box_txt_path': box_txt,
                         'y1': y1, 'y2': y2,
                         'x1': x1, 'x2': x2,
                         'pad_h': (y2 - y1) < self.img_size,
@@ -135,13 +143,27 @@ class EnsExamRealDataset(Dataset):
             Iin = cv2.copyMakeBorder(Iin, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
             Igt = cv2.copyMakeBorder(Igt, 0, pad_h, 0, pad_w, cv2.BORDER_REPLICATE)
 
-        # 3. 数据增强（albumentations additional_targets 保证 Iin/Igt 变换一致）
-        if self.augment:
-            result = self.aug(image=Iin, gt=Igt)
-            Iin, Igt = result['image'], result['gt']
+        # 3. 生成 Mb（增强前，坐标在原图空间）
+        #    有 box_label_txt 时用精确四边形标注；否则退回像素差值+膨胀
+        box_txt = info['box_txt_path']
+        if box_txt and os.path.exists(box_txt):
+            Mb_pre = generate_mb_from_boxes(
+                box_txt,
+                info['x1'], info['y1'], info['x2'], info['y2'],
+                self.img_size,
+            )
+        else:
+            _, Mb_float = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
+            Mb_pre = (Mb_float > 0.5).astype(np.uint8)
 
-        # 4. 生成软笔画掩码 Ms 和文本块掩码 Mb
-        Ms_gt_np, Mb_gt_np = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
+        # 4. 数据增强（Iin/Igt/Mb 施加相同的空间变换）
+        if self.augment:
+            result = self.aug(image=Iin, gt=Igt, mb=Mb_pre)
+            Iin, Igt, Mb_pre = result['image'], result['gt'], result['mb']
+
+        # 5. 增强后从像素差值生成 Ms；Mb 直接用增强后的结果
+        Ms_gt_np, _ = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
+        Mb_gt_np = Mb_pre.astype(np.float32)
 
         # 5. 图像归一化到 [-1, 1]
         Iin = self.img_transform(Iin.copy())   # (3, H, W)
