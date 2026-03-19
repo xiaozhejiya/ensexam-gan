@@ -27,28 +27,28 @@ train:
   adam_betas: [0.5, 0.9]      # Adam 动量参数，GAN 训练通常用 (0.5, 0.9) 而非默认 (0.9, 0.999)
   device: auto                # "auto" 自动选择 cuda/cpu，也可手动指定 "cuda:0"
   num_workers: 0              # DataLoader 子进程数，Windows 下必须为 0
-  save_every_n_epochs: 5      # 每隔多少 epoch 保存一次 checkpoint
+  save_every_n_epochs: 3      # 每隔多少 epoch 保存一次 checkpoint
   save_dir: ./ensexam_checkpoints
-  resume: false               # 是否从 resume_path 断点续训
-  resume_path: ./ensexam_checkpoints/latest.pth
+  resume: false              # 是否从 resume_path 断点续训
+  resume_path: /home/aistudio/ensexam-gan/ensexam_checkpoints/latest.pth
 
 # ── 数据集与预处理 ─────────────────────────────────────────────────────────────
 data:
-  data_root: E:/dataset/SCUT-EnsExam   # 数据集根目录，需含 train/test 子目录
+  data_root: /home/aistudio/SCUT-EnsExam   # 数据集根目录，需含 train/test 子目录
   img_size: 512               # 裁剪块大小，模型固定输入尺寸
   overlap: 0                  # 滑动裁剪重叠像素，设为 128 可增加训练样本量
   mask_threshold: 20          # 生成掩码时判断像素差异的阈值（0~255），越小掩码越密
 
   # 数据增强（albumentations）；注释掉整个 augmentation 节可完全关闭增强
-  augmentation:
-    horizontal_flip_p: 0.5          # 水平翻转概率
-    vertical_flip_p: 0.3            # 垂直翻转概率
-    rotate90_p: 0.3                 # 随机旋转 90/180/270° 概率（仅适用于正方形 patch）
-    brightness_limit: 0.2           # 亮度扰动幅度，实际范围 [-0.2, 0.2]
-    contrast_limit: 0.2             # 对比度扰动幅度，实际范围 [-0.2, 0.2]
-    brightness_contrast_p: 0.5      # 亮度/对比度增强整体概率
-    gauss_noise_var_limit: [10, 50] # 高斯噪声方差范围（像素强度²），模拟扫描噪点
-    gauss_noise_p: 0.2              # 高斯噪声概率
+#   augmentation:
+#     horizontal_flip_p: 0.5          # 水平翻转概率
+#     vertical_flip_p: 0.3            # 垂直翻转概率
+#     rotate90_p: 0.3                 # 随机旋转 90/180/270° 概率（仅适用于正方形 patch）
+#     brightness_limit: 0.2           # 亮度扰动幅度，实际范围 [-0.2, 0.2]
+#     contrast_limit: 0.2             # 对比度扰动幅度，实际范围 [-0.2, 0.2]
+#     brightness_contrast_p: 0.5      # 亮度/对比度增强整体概率
+#     gauss_noise_var_limit: [10, 50] # 高斯噪声方差范围（像素强度²），模拟扫描噪点
+#     gauss_noise_p: 0.2              # 高斯噪声概率
 
 # ── 早停 ───────────────────────────────────────────────────────────────────────
 early_stopping:
@@ -93,6 +93,6 @@ tuning:
 # ── W&B ────────────────────────────────────────────────────────────────────────
 wandb:
   enabled: true
-  project: ensexam             # W&B 项目名，同名实验会归到同一个项目下
+  project: ensexam_zero           # W&B 项目名，同名实验会归到同一个项目下
   run_name: null               # null = W&B 自动生成随机名称（如 "golden-dawn-42"）
   log_image_every_n_epochs: 5  # 每隔多少 epoch 上传一批擦除对比图
