@@ -195,15 +195,16 @@ def train_ensexam(cfg: dict):
     es_cfg    = cfg.get('early_stopping', {})
     log_cfg   = cfg.get('logging', {})
 
-    epochs      = train_cfg['epochs']
-    batch_size  = train_cfg['batch_size']
-    lr          = train_cfg['lr']
-    adam_betas  = tuple(train_cfg['adam_betas'])
-    save_dir    = train_cfg['save_dir']
-    resume      = train_cfg['resume']
-    resume_path = train_cfg['resume_path']
-    num_workers = train_cfg['num_workers']
-    save_every  = train_cfg['save_every_n_epochs']
+    epochs             = train_cfg['epochs']
+    batch_size         = train_cfg['batch_size']
+    lr                 = train_cfg['lr']
+    adam_betas         = tuple(train_cfg['adam_betas'])
+    save_dir           = train_cfg['save_dir']
+    resume             = train_cfg['resume']
+    resume_path        = train_cfg['resume_path']
+    num_workers        = train_cfg['num_workers']
+    save_every         = train_cfg['save_every_n_epochs']
+    curriculum_epochs  = train_cfg.get('curriculum_epochs', 20)  # 课程学习总 epoch 数
 
     data_root      = data_cfg['data_root']
     img_size       = data_cfg['img_size']
@@ -285,15 +286,23 @@ def train_ensexam(cfg: dict):
         pbar = tqdm(train_prefetcher, total=len(train_loader),
                     desc=f"Epoch {epoch + 1}/{epochs}", ncols=100)
 
+        # 课程学习系数：从 1.0 线性衰减到 0.0，前 curriculum_epochs epoch 用 GT 引导
+        alpha = max(0.0, 1.0 - epoch / max(curriculum_epochs, 1))
+
         for Iin, Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt in pbar:
             gt   = (Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt)
 
             # 训练判别器
             optimizer_D.zero_grad()
-            gen_out = G(Iin)
-            Icomp   = gen_out[-1]
+            # Teacher Forcing：alpha>0 时向 RefineNet 传入 Ms_gt
+            ms_input = Ms_gt if alpha > 0 else None
+            gen_out  = G(Iin, ms_gt=ms_input)
+            Ms, Mb, Ic4, Ic2, Ic1, Ire, _ = gen_out
+            # 课程学习融合：用 Mb_gt 替代预测 Mb 参与 Icomp 合成，避免早期 Mb 误导
+            Mb_fused = alpha * Mb_gt + (1.0 - alpha) * Mb.detach()
+            Icomp    = (Ire * Mb_fused + Iin * (1.0 - Mb_fused)).detach()
             real_g, real_l = D(Igt, Mb_gt)
-            fake_g, fake_l = D(Icomp.detach(), Mb_gt)
+            fake_g, fake_l = D(Icomp, Mb_gt)
             loss_D = (EnsExamLoss.hinge_loss_D(real_g, fake_g)
                       + EnsExamLoss.hinge_loss_D(real_l, fake_l)) / 2
             loss_D.backward()
@@ -301,8 +310,11 @@ def train_ensexam(cfg: dict):
 
             # 训练生成器
             optimizer_G.zero_grad()
-            fake_g, fake_l = D(Icomp, Mb_gt)
-            loss_G, parts  = criterion(gen_out, gt, (fake_g, fake_l))
+            Mb_fused_g = alpha * Mb_gt + (1.0 - alpha) * Mb
+            Icomp_g    = Ire * Mb_fused_g + Iin * (1.0 - Mb_fused_g)
+            fake_g, fake_l = D(Icomp_g, Mb_gt)
+            gen_out_loss = (Ms, Mb, Ic4, Ic2, Ic1, Ire, Icomp_g)
+            loss_G, parts  = criterion(gen_out_loss, gt, (fake_g, fake_l))
             loss_G.backward()
             optimizer_G.step()
 

@@ -75,9 +75,8 @@ class EnsExamLoss(nn.Module):
         if valid_mask.sum() == 0:
             return Ms.sum() * 0
         l1_sum = torch.sum(torch.abs(Ms - Ms_gt), dim=tuple(range(1, Ms.dim())))
-        sum_pred = torch.sum(Ms, dim=tuple(range(1, Ms.dim())))
-        normalization = torch.min(sum_pred, sum_gt)
-        loss_batch = l1_sum / (normalization + 1e-6)
+        # 用 sum_gt 作固定分母：反映相对 GT 的误差，避免过度预测时梯度失真
+        loss_batch = l1_sum / (sum_gt + 1e-6)
         L_sn = (loss_batch * valid_mask).sum() / (valid_mask.sum() + 1e-6)
         return L_sn
 

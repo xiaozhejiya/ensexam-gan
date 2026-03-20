@@ -15,9 +15,9 @@ loss:
 
   lambda_lr: 1.0              # LR Loss 总缩放系数
   lambda_p: 0.05              # 感知损失（VGG 特征 L1）权重，太大会模糊
-  lambda_style: 120           # 风格损失（Gram 矩阵）权重，控制纹理一致性
-  lambda_sn: 1.0              # SN Loss 权重，监督软笔画掩码 Ms 的精度
-  lambda_b: 0.4               # Block Loss 权重，监督文本块掩码 Mb（Dice Loss）
+  lambda_style: 30            # 风格损失（Gram 矩阵）权重，控制纹理一致性（原120过大，压制掩码监督）
+  lambda_sn: 3.0              # SN Loss 权重，监督软笔画掩码 Ms 的精度（原1.0权重不足）
+  lambda_b: 1.0               # Block Loss 权重，监督文本块掩码 Mb（Dice Loss）（原0.4权重不足）
 
 # ── 训练超参数 ─────────────────────────────────────────────────────────────────
 train:
@@ -30,14 +30,15 @@ train:
   save_every_n_epochs: 3      # 每隔多少 epoch 保存一次 checkpoint
   save_dir: ./ensexam_checkpoints
   resume: false              # 是否从 resume_path 断点续训
+  curriculum_epochs: 20      # 课程学习：前 N epoch 用 Mb_gt 引导 Icomp 融合和 RefineNet 输入
   resume_path: /home/aistudio/ensexam-gan/ensexam_checkpoints/latest.pth
 
 # ── 数据集与预处理 ─────────────────────────────────────────────────────────────
 data:
   data_root: /home/aistudio/SCUT-EnsExam   # 数据集根目录，需含 train/test 子目录
   img_size: 512               # 裁剪块大小，模型固定输入尺寸
-  overlap: 0                  # 滑动裁剪重叠像素，设为 128 可增加训练样本量
-  mask_threshold: 20          # 生成掩码时判断像素差异的阈值（0~255），越小掩码越密
+  overlap: 128                # 滑动裁剪重叠像素，128 可增加约 50% 样本多样性（原0样本量偏少）
+  mask_threshold: 12          # 生成掩码时判断像素差异的阈值（0~255），原20会漏掉浅色笔迹
 
   # 数据增强（albumentations）；注释掉整个 augmentation 节可完全关闭增强
 #   augmentation:
@@ -87,7 +88,7 @@ tuning:
     lr: [1.0e-5, 1.0e-3]      # log scale，最影响收敛速度
     beta1: [0.3, 0.7]          # Adam β₁，GAN 训练对此敏感
     lambda_p: [0.01, 0.2]      # log scale，感知损失权重
-    lambda_style: [50, 300]    # log scale，风格损失权重
+    lambda_style: [20, 80]     # log scale，风格损失权重（收窄范围，避免过大压制掩码损失）
     lambda_b: [0.1, 1.0]       # Block Loss（Dice）权重
 
 # ── W&B ────────────────────────────────────────────────────────────────────────

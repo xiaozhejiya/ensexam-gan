@@ -122,8 +122,10 @@ class Generator(nn.Module):
                                 cbam_reduction=cfg['cbam_reduction'])
         self.refine = RefineNet(in_channels=cfg['refine_in_channels'])
 
-    def forward(self, Iin: torch.Tensor):
+    def forward(self, Iin: torch.Tensor, ms_gt: torch.Tensor = None):
         Ms, Mb, Ic4, Ic2, Ic1 = self.coarse(Iin)
-        Ire = self.refine(torch.cat([Iin, Ms, Ic1], dim=1))
+        # ms_gt 不为 None 时启用 Teacher Forcing：用 GT 掩码引导 RefineNet（训练早期）
+        ms_input = ms_gt if ms_gt is not None else Ms
+        Ire = self.refine(torch.cat([Iin, ms_input, Ic1], dim=1))
         Icomp = Ire * Mb + Iin * (1 - Mb)
         return Ms, Mb, Ic4, Ic2, Ic1, Ire, Icomp

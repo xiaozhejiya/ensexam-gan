@@ -28,48 +28,52 @@ def generate_mask_from_pair(Iin, Igt, threshold=20, debug=False):
     denoised_mask = cv2.morphologyEx(coarse_mask, cv2.MORPH_OPEN, kernel)
     denoised_mask = cv2.morphologyEx(denoised_mask, cv2.MORPH_CLOSE, kernel)
 
-    # ========== 3. 生成 Mb_gt（基础文本块掩码） ==========
-    # 对去噪后的掩码适度膨胀，作为文本区域指导
-    Mb_gt = cv2.dilate(denoised_mask, kernel, iterations=2).astype(np.float32)
+    # ========== 3. 生成 Mb_gt（文本块掩码） ==========
+    # 论文 Eq.(3): Icomp = Ire·Mb + Iin·(1-Mb)
+    # Mb 是文字区域的矩形边框填充（bounding-box region），用于合成时区分文字/背景
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(denoised_mask, connectivity=8)
+    Mb_gt = np.zeros((H, W), dtype=np.float32)
+    for idx in range(1, num_labels):
+        x0 = stats[idx, cv2.CC_STAT_LEFT]
+        y0 = stats[idx, cv2.CC_STAT_TOP]
+        bw = stats[idx, cv2.CC_STAT_WIDTH]
+        bh = stats[idx, cv2.CC_STAT_HEIGHT]
+        Mb_gt[y0:y0 + bh, x0:x0 + bw] = 1.0
 
     # ========== 4. 生成软笔画掩码 Ms_gt ==========
-    # 4.1 骨架：笔画收缩1像素（论文明确要求）
+    # 4.1 骨架：笔画收缩1像素（论文要求）
     skeleton = cv2.erode(denoised_mask, kernel, iterations=1)
 
-    # 4.2 外边界区域：原始笔画扩张5像素
-    kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    outer_region = cv2.dilate(denoised_mask, kernel_large, iterations=5)
+    # 4.2 外边界区域：原始笔画扩张5像素（3×3 kernel 半径=1px，5次=恰好5px）
+    kernel_outer = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    outer_region = cv2.dilate(denoised_mask, kernel_outer, iterations=5)
 
-    # 4.3 距离变换：计算outer_region内每个像素到边缘的最短距离
-    # 输入要求：uint8, 0=背景, >0=前景；输出：float32，单位像素
-    dist_map = cv2.distanceTransform(outer_region, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    # 4.3 距离变换：计算每个像素到最近笔画像素的距离
+    # 在反转掩码上做DT：笔画内部=0，笔画外部=到最近笔画边缘的欧氏距离
+    # 这样D(i,j) = L - dist_to_stroke，即到外边界(5px处)的距离，逐笔画独立计算
+    # 避免稠密文字时多笔画合并成大区域导致内部距离失真（出现矩形块）
+    dist_to_stroke = cv2.distanceTransform(
+        (1 - denoised_mask).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
 
-    # 4.4 SAF 参数 (论文明确值)
+    # 4.4 SAF 参数 (论文: α=3, L=5)
     alpha = 3.0
     L = 5.0
     exp_neg_alpha = np.exp(-alpha)
-    C = (1 + exp_neg_alpha) / (1 - exp_neg_alpha + 1e-8)  # +eps防除零
+    C = (1 + exp_neg_alpha) / (1 - exp_neg_alpha + 1e-8)
 
-    # 4.5 向量化计算软掩码（避免循环，提速100x）
+    # 4.5 向量化计算软掩码
     Ms_gt = np.zeros((H, W), dtype=np.float32)
+    mask_skeleton = skeleton > 0
+    mask_outer = outer_region > 0
 
-    # 区域划分mask
-    mask_skeleton = skeleton > 0  # 骨架区域 → 值=1
-    mask_outer = outer_region > 0  # 扩张区域（含骨架）
-    mask_middle = mask_outer & (~mask_skeleton)  # 中间环形区域 → 用SAF
+    # D(i,j) = L - dist_to_stroke：笔画内dist=0→D=L=5(SAF≈1)，外边界dist=5→D=0(SAF=0)
+    D_map = np.clip(L - dist_to_stroke, 0.0, L)
+    exp_term = np.exp(-alpha * D_map[mask_outer] / L)
+    saf_vals = C * (2.0 / (1.0 + exp_term + 1e-8) - 1.0)
+    Ms_gt[mask_outer] = np.clip(saf_vals, 0.0, 1.0)
 
-    # (a) 骨架区域强制=1
+    # 骨架强制=1（覆盖SAF结果，确保笔画中心最亮）
     Ms_gt[mask_skeleton] = 1.0
-
-    # (b) 中间区域应用SAF衰减
-    if np.any(mask_middle):
-        D = np.clip(dist_map[mask_middle], 0, L)  # 距离截断到[0, L]
-        # SAF公式: C * (2/(1+exp(-α*D/L)) - 1)
-        exp_term = np.exp(-alpha * D / L)
-        saf_vals = C * (2.0 / (1.0 + exp_term + 1e-8) - 1.0)
-        Ms_gt[mask_middle] = np.clip(saf_vals, 0.0, 1.0)
-
-    # (c) 外边界及以外区域保持=0（已初始化为0）
 
     # ========== 5. 调试信息（可选） ==========
     if debug:
@@ -78,8 +82,9 @@ def generate_mask_from_pair(Iin, Igt, threshold=20, debug=False):
             'denoised_mask': denoised_mask,
             'skeleton': skeleton,
             'outer_region': outer_region,
-            'dist_map': dist_map,
-            'mask_middle': mask_middle.astype(np.uint8) * 255
+            'dist_to_stroke': dist_to_stroke,
+            'D_map': D_map,
+            'mask_middle': (mask_outer & (~mask_skeleton)).astype(np.uint8) * 255
         }
         return Ms_gt, Mb_gt, debug_info
 

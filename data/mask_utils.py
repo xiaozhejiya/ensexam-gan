@@ -144,9 +144,14 @@ def generate_mb_from_boxes(txt_path: str,
         if by_max <= crop_y1 or by_min >= crop_y2:
             continue
 
-        # 坐标平移到 patch 局部空间，并裁剪到 [0, patch_size-1]
+        # 坐标平移到 patch 局部空间，缩放到 [0, patch_size-1]
         pts[:, 0] -= crop_x1
         pts[:, 1] -= crop_y1
+        # 边界 patch 的 crop 尺寸可能小于 patch_size（需 padding 补齐），须先缩放再 clip
+        scale_x = patch_size / max(crop_x2 - crop_x1, 1)
+        scale_y = patch_size / max(crop_y2 - crop_y1, 1)
+        pts[:, 0] = pts[:, 0] * scale_x
+        pts[:, 1] = pts[:, 1] * scale_y
         pts = np.clip(pts, 0, patch_size - 1).astype(np.int32)
 
         cv2.fillPoly(Mb, [pts], 1)
