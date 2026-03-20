@@ -70,9 +70,16 @@ class EnsExamLoss(nn.Module):
 
     def sn_loss(self, Ms: torch.Tensor, Ms_gt: torch.Tensor) -> torch.Tensor:
         """SN Loss：软笔画掩码 L1，按笔画稀疏度归一化，避免空白样本主导梯度。"""
-        l1 = torch.sum(torch.abs(Ms - Ms_gt), dim=[1, 2, 3])
-        norm = torch.min(Ms.sum([1, 2, 3]), Ms_gt.sum([1, 2, 3]))
-        return (l1 / (norm + 1e-6)).mean()
+        sum_gt = torch.sum(Ms_gt, dim=tuple(range(1, Ms.dim())))
+        valid_mask = (sum_gt > 1.0).float()
+        if valid_mask.sum() == 0:
+            return Ms.sum() * 0
+        l1_sum = torch.sum(torch.abs(Ms - Ms_gt), dim=tuple(range(1, Ms.dim())))
+        sum_pred = torch.sum(Ms, dim=tuple(range(1, Ms.dim())))
+        normalization = torch.min(sum_pred, sum_gt)
+        loss_batch = l1_sum / (normalization + 1e-6)
+        L_sn = (loss_batch * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+        return L_sn
 
     def block_loss(self, Mb: torch.Tensor, Mb_gt: torch.Tensor) -> torch.Tensor:
         """Block Loss：Dice Loss，对文本块掩码形状监督，缓解正负样本不平衡。"""
