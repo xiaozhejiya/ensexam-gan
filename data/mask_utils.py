@@ -23,7 +23,7 @@ def generate_mask_from_pair(Iin, Igt, threshold=20, debug=False):
     # ========== 1. 生成粗笔画掩码 ==========
     # 使用int16避免溢出，计算RGB三通道的平均差异
     diff = np.abs(Iin.astype(np.int16) - Igt.astype(np.int16)).mean(axis=-1)
-    print(f"Diff统计: min={diff.min()}, max={diff.max()}, 90%={np.percentile(diff, 90)}")
+    # print(f"Diff统计: min={diff.min()}, max={diff.max()}, 90%={np.percentile(diff, 90)}")
     coarse_mask = (diff > threshold).astype(np.uint8)
 
     # ========== 2. 形态学去噪 ==========
