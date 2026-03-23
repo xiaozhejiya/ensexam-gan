@@ -6,24 +6,80 @@
 
 ## 模型架构
 
-```
-输入 Iin (含笔迹)
-     │
-     ▼
-┌─────────────────┐
-│   CoarseNet     │  U-Net + CBAM 双解码器
-│  ├── 修复分支   │  → Ic4 / Ic2 / Ic1（多尺度修复图）
-│  └── 掩码分支   │  → Ms（软笔画掩码）/ Mb（文本块掩码）
-└────────┬────────┘
-         │ concat(Iin, Ms, Ic1)
-         ▼
-┌─────────────────┐
-│   RefineNet     │  空洞卷积 U-Net，扩大感受野
-│                 │  → Ire（精细修复图）
-└────────┬────────┘
-         │
-         ▼
-  Icomp = Ire × Mb + Iin × (1 - Mb)   ← 融合输出
+```mermaid
+flowchart TD
+    Iin(["Iin　含笔迹输入\n3ch · H×W"])
+
+    subgraph CoarseNet["CoarseNet　粗擦除 + 掩码预测"]
+        direction TB
+
+        subgraph ENC["残差编码器（EraseNet 风格）"]
+            direction TB
+            E1["conv1 / conva\nH/2 · 32ch"]
+            E2["convb + ResBlock×2\nH/4 · 64ch"]
+            E3["ResBlock×2\nH/8 · 128ch"]
+            E4["ResBlock×2\nH/16 · 256ch"]
+            E5["ResBlock×2 + conv2\nH/32 · 512ch　瓶颈"]
+            E1-->E2-->E3-->E4-->E5
+        end
+
+        subgraph RD["修复解码器　CBAM UpSample + LateralConnection 跳跃连接"]
+            direction TB
+            U1["UpSample + lat(con_x4)\nH/16 · 512ch"]
+            U2["UpSample + lat(con_x3)\nH/8 · 256ch"]
+            U3["UpSample\nH/4 · 64ch"]
+            Ic4(["Ic4　H/4 · 3ch"])
+            U4["UpSample + lat(con_x2)\nH/2 · 32ch"]
+            Ic2(["Ic2　H/2 · 3ch"])
+            U5["UpSample + lat(con_x1)\nH · 32ch"]
+            Ic1(["Ic1　H · 3ch"])
+            U1-->U2-->U3-->Ic4
+            U3-->U4-->Ic2
+            U4-->U5-->Ic1
+        end
+
+        subgraph MD["掩码解码器　从瓶颈出发保留全局上下文"]
+            direction TB
+            M0["mask_up_0　H/32→H/16 · 256ch"]
+            MA["mask_up_a + con_x4\nH/8 · 256ch"]
+            MB["mask_up_b + con_x3\nH/4 · 128ch"]
+            MC["mask_up_c + con_x2\nH/2 · 64ch"]
+            MD2["mask_up_d + con_x1\nH · 32ch"]
+            Ms(["Ms　软笔画掩码\n1ch · sigmoid"])
+            Mb(["Mb　文本块掩码\n1ch · sigmoid"])
+            M0-->MA-->MB-->MC-->MD2-->Ms
+            MD2-->Mb
+        end
+
+        E5-->U1
+        E5-->M0
+    end
+
+    CAT["cat(Iin, Ms, Ic1)　7ch"]
+
+    subgraph RefineNet["RefineNet　多尺度空洞卷积精细修复（EraseNet 风格）"]
+        direction TB
+        R1["conva + DownSample\nH/2 · 64ch"]
+        R2["DownSample + conv\nH/4 · 128ch"]
+        R3["空洞卷积 ×4\ndilation 2 / 4 / 8 / 16"]
+        R4["UpSample + skip(H/4)\nH/2 · 64ch"]
+        R5["UpSample + skip(H/2) → conv\nH · 3ch"]
+        Ire(["Ire　精细修复图\n3ch · tanh"])
+        R1-->R2-->R3-->R4-->R5-->Ire
+    end
+
+    FUSE["Icomp = Ire × Mb + Iin × (1 − Mb)"]
+    Out(["Icomp　最终输出\n3ch · H×W"])
+
+    Iin --> ENC
+    Iin --> CAT
+    Iin --> FUSE
+    Ic1 --> CAT
+    Ms  --> CAT
+    CAT --> R1
+    Ire --> FUSE
+    Mb  --> FUSE
+    FUSE --> Out
 ```
 
 **判别器**：Local-Global Hinge GAN，全局判别器 + 掩码加权局部判别器。
