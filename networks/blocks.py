@@ -79,16 +79,57 @@ class DownSample(nn.Module):
         return self.conv(x)
 
 
+class ResBlock(nn.Module):
+    """残差块，参照 EraseNet Residual：conv1(stride) → ReLU → conv2 + skip → BN → ReLU。
+
+    stride=1 时要求 in_channels == out_channels（无投影）；
+    stride=2 时自动添加 1×1 skip 投影以匹配通道和尺寸。
+    """
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, stride=stride, padding=1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.bn    = nn.BatchNorm2d(out_channels)
+        self.skip  = (nn.Conv2d(in_channels, out_channels, 1, stride=stride)
+                      if (stride != 1 or in_channels != out_channels) else None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = F.relu(self.conv1(x))
+        out = self.conv2(out)
+        identity = self.skip(x) if self.skip is not None else x
+        return F.relu(self.bn(out + identity))
+
+
+class LateralConnection(nn.Module):
+    """跳跃连接特征精炼：1×1 → 3×3 → 3×3 → 1×1，参照 EraseNet lateral_connection。
+
+    输入输出通道数相同，中间扩张为 2×channels。
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        inner = channels * 2
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.Conv2d(channels, inner,    3, padding=1),
+            nn.Conv2d(inner,    inner,    3, padding=1),
+            nn.Conv2d(inner,    channels, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class UpSample(nn.Module):
     """U-Net 解码器上采样块：转置卷积，分辨率翻倍，可选 CBAM 注意力。"""
-    def __init__(self, in_channels: int, out_channels: int, use_cbam: bool = False):
+    def __init__(self, in_channels: int, out_channels: int,
+                 use_cbam: bool = False, reduction: int = 16):
         super().__init__()
         self.conv = nn.Sequential(
             nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
-        self.cbam = CBAM(out_channels) if use_cbam else nn.Identity()
+        self.cbam = CBAM(out_channels, reduction) if use_cbam else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.cbam(self.conv(x))

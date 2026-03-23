@@ -373,18 +373,18 @@ def train_ensexam(cfg: dict):
 
         # 保存最优模型（由早停判定）
         if es is not None:
-            if es.is_best:
-                torch.save(ckpt, os.path.join(save_dir, 'best.pth'))
-                logger.info(f"已更新最优模型 best.pth（val_loss={val_loss:.4f}）")
-                if wb_run is not None:
-                    wandb.run.summary['best_val_loss'] = val_loss
-                    wandb.run.summary['best_epoch']    = epoch + 1
             if es.step(val_loss, epoch + 1):
                 logger.info(
                     f"早停触发：连续 {es.patience} epoch 无改善，"
                     f"最优 epoch={es.best_epoch}，val_loss={es.best_value:.4f}"
                 )
                 break
+            if es.is_best:
+                torch.save(ckpt, os.path.join(save_dir, 'best.pth'))
+                logger.info(f"已更新最优模型 best.pth（val_loss={val_loss:.4f}）")
+                if wb_run is not None:
+                    wandb.run.summary['best_val_loss'] = val_loss
+                    wandb.run.summary['best_epoch']    = epoch + 1
 
     if wb_run is not None:
         wandb.finish()
