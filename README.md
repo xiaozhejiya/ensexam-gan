@@ -26,7 +26,7 @@ flowchart LR
         RF["多尺度空洞卷积<br/>Dilation 2 / 4 / 8 / 16<br/>Ire"]
     end
 
-    FUSE["融合模块<br/>Icomp = Ire × Mb + Iin × (1 − Mb)"]
+    FUSE["融合模块<br/>Icomp = Ire × Mb + Iin × <br/>(1 − Mb)"]
     Out["最终输出<br/>Icomp"]
 
     Iin --> CoarseNet
