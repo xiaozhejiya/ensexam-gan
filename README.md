@@ -7,32 +7,48 @@
 ## 模型架构
 
 ```mermaid
-flowchart TD
-    Iin(["Iin　含笔迹输入"])
+flowchart LR
 
-    subgraph CoarseNet["CoarseNet　粗擦除 + 掩码预测"]
-        ENC["残差编码器\nResBlock × 8"]
-        RD["修复解码器\nLateralConnection 跳跃连接\n→ Ic4 / Ic2 / Ic1"]
-        MD["掩码解码器\n从瓶颈出发\n→ Ms / Mb"]
+    Iin["Iin<br/>含笔迹输入"]
+
+    subgraph CoarseNet["CoarseNet｜粗擦除 + 掩码预测"]
+        direction TB
+        ENC["残差编码器<br/>ResBlock × 8"]
+        RD["修复解码器<br/>Lateral Connection 跳跃连接<br/>Ic4 / Ic2 / Ic1"]
+        MD["掩码解码器<br/>从瓶颈特征出发<br/>Ms / Mb"]
+
         ENC --> RD
         ENC --> MD
     end
 
-    subgraph RefineNet["RefineNet　精细修复"]
-        RF["多尺度空洞卷积\ndilation 2 / 4 / 8 / 16\n→ Ire"]
+    subgraph RefineNet["RefineNet｜精细修复"]
+        direction TB
+        RF["多尺度空洞卷积<br/>Dilation 2 / 4 / 8 / 16<br/>Ire"]
     end
 
-    FUSE["Icomp = Ire × Mb + Iin × (1 − Mb)"]
-    Out(["Icomp　最终输出"])
+    FUSE["融合模块<br/>Icomp = Ire × Mb + Iin × <br/>(1 − Mb)"]
+    Out["最终输出<br/>Icomp"]
 
-    Iin --> ENC
-    Iin --> FUSE
-    RD -- "Ic1" --> RF
-    MD -- "Ms" --> RF
-    Iin -- "拼接" --> RF
+    Iin --> CoarseNet
+    RD -- Ic1 --> RF
+    MD -- Ms --> RF
+    Iin -- 拼接 --> RF
     RF --> FUSE
-    MD -- "Mb" --> FUSE
+    MD -- Mb --> FUSE
+    Iin --> FUSE
     FUSE --> Out
+
+    classDef input fill:#EAF4FF,stroke:#4A90E2,stroke-width:2px,color:#111;
+    classDef coarse fill:#FFF3E6,stroke:#E67E22,stroke-width:2px,color:#111;
+    classDef refine fill:#EAFBF3,stroke:#27AE60,stroke-width:2px,color:#111;
+    classDef fusion fill:#F4ECFF,stroke:#8E44AD,stroke-width:2px,color:#111;
+    classDef output fill:#FFF8E8,stroke:#C0392B,stroke-width:2px,color:#111;
+
+    class Iin input
+    class ENC,RD,MD coarse
+    class RF refine
+    class FUSE fusion
+    class Out output
 ```
 
 **判别器**：Local-Global Hinge GAN，全局判别器 + 掩码加权局部判别器。
