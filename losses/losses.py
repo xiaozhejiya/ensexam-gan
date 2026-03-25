@@ -108,12 +108,11 @@ class EnsExamLoss(nn.Module):
 
     def style_loss(self, I_list: list, Igt: torch.Tensor) -> torch.Tensor:
         """风格损失：Gram 矩阵 L1，控制纹理和笔触风格一致性。"""
-        gt_feats = self.vgg_feat(Igt)
+        gt_grams = [gram_matrix(f).detach() for f in self.vgg_feat(Igt)]
         loss = 0.0
         for I in I_list:
-            for f1, f2 in zip(self.vgg_feat(I), gt_feats):
-                b, c, h, w = f1.shape
-                loss += F.l1_loss(gram_matrix(f1), gram_matrix(f2)) / (h * w * c)
+            for f_pred, G_gt in zip(self.vgg_feat(I), gt_grams):
+                loss += torch.abs(gram_matrix(f_pred) - G_gt).sum(dim=(1, 2)).mean()
         return loss
 
     # ── GAN Hinge Loss ────────────────────────────────────────────────────

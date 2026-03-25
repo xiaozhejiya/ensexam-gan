@@ -21,7 +21,7 @@ loss:
 
 # ── 训练超参数 ─────────────────────────────────────────────────────────────────
 train:
-  epochs: 100
+  epochs: 90
   batch_size: 8
   lr: 0.0001                  # Adam 初始学习率
   adam_betas: [0.5, 0.9]      # Adam 动量参数，GAN 训练通常用 (0.5, 0.9) 而非默认 (0.9, 0.999)
@@ -30,7 +30,15 @@ train:
   save_every_n_epochs: 3      # 每隔多少 epoch 保存一次 checkpoint
   save_dir: ./ensexam_checkpoints
   resume: true              # 是否从 resume_path 断点续训
-  resume_path: ./ensexam_checkpoints/reptile_meta_init.pth
+  resume_path: ./reptile_checkpoints\reptile_meta_init.pth
+
+  # 学习率调度器
+  scheduler:
+    enabled: true
+    type: cosine            # cosine | cosine_restart
+    eta_min: 5.0e-7         # 最小学习率下限
+    T_0: 20                 # 仅 cosine_restart：第一个周期长度（epoch）
+    T_mult: 2               # 仅 cosine_restart：每次重启后周期倍增系数
 
 # ── 数据集与预处理 ─────────────────────────────────────────────────────────────
 data:
@@ -68,9 +76,10 @@ logging:
 reptile:
   meta_epochs: 500            # 500 episode，每张图平均被元训练 ~4.7 次
   inner_lr: 0.0001            # 与 train.lr 保持一致
-  inner_steps: 1              # 每 task 仅 ~2 batch，1 步看一半数据即可，防止过拟合
+  inner_steps: 2              # 每 task ~2 batch，2 步遍历该图全部 patch；Reptile 对过拟合较鲁棒
   meta_lr: 0.1                # ε，Reptile 标准值
-  n_tasks_per_episode: 4      # 每 episode 采样 4 张图（共 430 张，足够随机）
+  n_tasks_per_episode: 8      # 每 episode 采样 8 张图，增加风格多样性（共 430 张）
+  log_every_n_epochs: 10      # 每隔多少 episode 打印一次平均损失
   save_every_n_epochs: 50     # 每 50 episode 保存一次中间 checkpoint
   save_dir: ./reptile_checkpoints
 

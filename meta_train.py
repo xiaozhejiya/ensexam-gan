@@ -11,10 +11,12 @@ Reptile 元训练入口：学习对所有试卷笔迹风格都泛化的初始参
 再运行 python train.py 进行二次训练。
 """
 import argparse
+import csv
 import logging
 import os
 import random
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -114,21 +116,52 @@ def meta_train(cfg: dict):
 
     meta_learner = ReptileMetaLearner(G, D, criterion, device, cfg)
 
-    save_dir   = reptile_cfg.get('save_dir', './reptile_checkpoints')
+    save_dir    = reptile_cfg.get('save_dir', './reptile_checkpoints')
     os.makedirs(save_dir, exist_ok=True)
     meta_epochs = reptile_cfg['meta_epochs']
     save_every  = reptile_cfg.get('save_every_n_epochs', 10)
+    log_every   = reptile_cfg.get('log_every_n_epochs', 10)
+
+    # CSV 日志
+    csv_path = os.path.join(log_dir, 'meta_loss_history.csv')
+    if not os.path.exists(csv_path):
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(['episode', 'loss_G', 'loss_D'])
+
+    # 滑动窗口：用于计算最近 log_every 个 episode 的平均损失
+    window_G = window_D = 0.0
+    t_start  = time.time()
 
     # 元训练循环
-    for epoch in tqdm(range(meta_epochs), desc='Meta-epochs', ncols=90):
+    for episode in tqdm(range(meta_epochs), desc='Meta-train', ncols=100):
         sampled = random.sample(task_loaders, n_tasks_per_ep)
-        meta_learner.run_episode(sampled)
+        stats   = meta_learner.run_episode(sampled)
 
-        if (epoch + 1) % save_every == 0 or epoch == meta_epochs - 1:
-            path = os.path.join(save_dir, f'reptile_epoch_{epoch + 1}.pth')
+        window_G += stats['loss_G']
+        window_D += stats['loss_D']
+
+        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(
+                [episode + 1, f"{stats['loss_G']:.6f}", f"{stats['loss_D']:.6f}"])
+
+        if (episode + 1) % log_every == 0:
+            avg_G    = window_G / log_every
+            avg_D    = window_D / log_every
+            elapsed  = time.time() - t_start
+            eta_sec  = elapsed / (episode + 1) * (meta_epochs - episode - 1)
+            eta_str  = time.strftime('%H:%M:%S', time.gmtime(eta_sec))
+            logger.info(
+                f"Episode {episode + 1:>4}/{meta_epochs} | "
+                f"G={avg_G:.4f}  D={avg_D:.4f} | "
+                f"elapsed={time.strftime('%H:%M:%S', time.gmtime(elapsed))}  ETA={eta_str}"
+            )
+            window_G = window_D = 0.0
+
+        if (episode + 1) % save_every == 0 or episode == meta_epochs - 1:
+            path = os.path.join(save_dir, f'reptile_epoch_{episode + 1}.pth')
             torch.save({'G_state_dict': G.state_dict(),
                         'D_state_dict': D.state_dict()}, path)
-            logger.info(f"Epoch {epoch + 1:>4}/{meta_epochs}  checkpoint → {path}")
+            logger.info(f"  checkpoint → {path}")
 
     # 保存供 train.py resume 使用的最终检查点
     final_path = os.path.join(save_dir, 'reptile_meta_init.pth')

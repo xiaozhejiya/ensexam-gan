@@ -251,6 +251,23 @@ def train_ensexam(cfg: dict):
     optimizer_G = optim.Adam(G.parameters(), lr=lr, betas=adam_betas)
     optimizer_D = optim.Adam(D.parameters(), lr=lr, betas=adam_betas)
 
+    # 学习率调度器
+    sch_cfg = train_cfg.get('scheduler', {})
+    scheduler_G = scheduler_D = None
+    if sch_cfg.get('enabled', False):
+        eta_min  = sch_cfg.get('eta_min', 1e-6)
+        sch_type = sch_cfg.get('type', 'cosine')
+        def _make_scheduler(opt):
+            if sch_type == 'cosine_restart':
+                return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    opt, T_0=sch_cfg.get('T_0', 20),
+                    T_mult=sch_cfg.get('T_mult', 2), eta_min=eta_min)
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=epochs, eta_min=eta_min)
+        scheduler_G = _make_scheduler(optimizer_G)
+        scheduler_D = _make_scheduler(optimizer_D)
+        logger.info(f"调度器已启用：type={sch_type}, eta_min={eta_min}")
+
     # 早停
     es = None
     if es_cfg.get('enabled', False):
@@ -272,6 +289,10 @@ def train_ensexam(cfg: dict):
             optimizer_G.load_state_dict(ckpt['optimizer_G'])
         if ckpt.get('optimizer_D'):
             optimizer_D.load_state_dict(ckpt['optimizer_D'])
+        if ckpt.get('scheduler_G') and scheduler_G is not None:
+            scheduler_G.load_state_dict(ckpt['scheduler_G'])
+        if ckpt.get('scheduler_D') and scheduler_D is not None:
+            scheduler_D.load_state_dict(ckpt['scheduler_D'])
         start_epoch = ckpt['epoch']
         logger.info(f"断点续训：从第 {start_epoch} epoch 恢复")
 
@@ -328,12 +349,13 @@ def train_ensexam(cfg: dict):
         val_loss = validate(G, val_loader, device)
         best_val_loss = min(best_val_loss, val_loss)
 
+        current_lr = optimizer_G.param_groups[0]['lr']
         logger.info(
             f"Epoch {epoch + 1:>4} | "
             f"Train G={avg_G:.4f}  D={avg_D:.4f} | "
-            f"adv={avg_parts[0]:.4f}  lr={avg_parts[1]:.4f}  "
+            f"adv={avg_parts[0]:.4f}  rec={avg_parts[1]:.4f}  "
             f"per={avg_parts[2]:.4f}  style={avg_parts[3]:.4f} | "
-            f"Val L1={val_loss:.4f}"
+            f"Val L1={val_loss:.4f} | LR={current_lr:.2e}"
         )
         csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_loss)
 
@@ -349,23 +371,29 @@ def train_ensexam(cfg: dict):
                 'train/sn':         avg_parts[4],
                 'train/block':      avg_parts[5],
                 'val/l1_loss':      val_loss,
+                'train/lr':         current_lr,
             }, step=epoch + 1)
             # 每隔 N epoch 上传对比图
             if (epoch + 1) % log_img_every == 0:
                 log_images_to_wandb(G, val_loader, device, epoch + 1)
 
-        # 保存 checkpoint
+        # 保存 checkpoint（先存再 step，确保 lr 与本 epoch 对应）
         ckpt = {
             'epoch': epoch + 1,
             'G_state_dict': G.state_dict(),
             'D_state_dict': D.state_dict(),
             'optimizer_G':  optimizer_G.state_dict(),
             'optimizer_D':  optimizer_D.state_dict(),
+            'scheduler_G':  scheduler_G.state_dict() if scheduler_G else None,
+            'scheduler_D':  scheduler_D.state_dict() if scheduler_D else None,
             'avg_loss_G':   avg_G,
             'avg_loss_D':   avg_D,
             'val_loss':     val_loss,
         }
         torch.save(ckpt, os.path.join(save_dir, 'latest.pth'))
+        if scheduler_G is not None:
+            scheduler_G.step()
+            scheduler_D.step()
         if (epoch + 1) % save_every == 0 or epoch == epochs - 1:
             path = os.path.join(save_dir, f'epoch_{epoch + 1}.pth')
             torch.save(ckpt, path)

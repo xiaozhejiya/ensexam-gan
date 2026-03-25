@@ -94,7 +94,7 @@ class ReptileMetaLearner:
         self.G.load_state_dict(G_meta_state)
         self.D.load_state_dict(D_meta_state)
 
-        return G_task_state, D_task_state
+        return G_task_state, D_task_state, loss_G.item(), loss_D.item()
 
     def _reptile_update(self, model: torch.nn.Module, task_states: list):
         """θ_meta += ε · mean(θ_task_i − θ_meta)，只更新浮点参数。"""
@@ -108,13 +108,23 @@ class ReptileMetaLearner:
             meta_state[key] = meta_state[key] + self.meta_lr * delta
         model.load_state_dict(meta_state)
 
-    def run_episode(self, task_loaders: list):
-        """对每个 task 做 inner loop，再做 Reptile outer update。"""
+    def run_episode(self, task_loaders: list) -> dict:
+        """对每个 task 做 inner loop，再做 Reptile outer update。
+
+        Returns:
+            stats: {'loss_G': float, 'loss_D': float}，所有 task 的平均损失
+        """
         G_task_states, D_task_states = [], []
+        sum_G = sum_D = 0.0
         for loader in task_loaders:
-            g_state, d_state = self._inner_loop(loader)
+            g_state, d_state, lg, ld = self._inner_loop(loader)
             G_task_states.append(g_state)
             D_task_states.append(d_state)
+            sum_G += lg
+            sum_D += ld
 
         self._reptile_update(self.G, G_task_states)
         self._reptile_update(self.D, D_task_states)
+
+        n = len(task_loaders)
+        return {'loss_G': sum_G / n, 'loss_D': sum_D / n}
