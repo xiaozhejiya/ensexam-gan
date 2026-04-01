@@ -9,6 +9,7 @@ import argparse
 import csv
 import logging
 import os
+import random
 import sys
 from datetime import datetime
 
@@ -33,6 +34,23 @@ from networks.generator import Generator
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools.early_stopping import EarlyStopping
+
+
+def set_seed(seed: int):
+    """固定所有随机源，使训练结果可复现。"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _worker_init_fn(worker_id: int):
+    """DataLoader worker 种子固定，确保数据增强顺序可复现。"""
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed + worker_id)
+    np.random.seed(seed + worker_id)
 
 
 class CUDAPrefetcher:
@@ -217,6 +235,11 @@ def train_ensexam(cfg: dict):
     wb_cfg  = cfg.get('wandb', {})
     log_img_every = wb_cfg.get('log_image_every_n_epochs', 5)
 
+    seed = train_cfg.get('seed', None)
+    if seed is not None:
+        set_seed(seed)
+        logger.info(f"随机种子已固定：{seed}")
+
     device_str = train_cfg['device']
     device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
               if device_str == 'auto' else torch.device(device_str))
@@ -235,9 +258,13 @@ def train_ensexam(cfg: dict):
         overlap=0, mask_threshold=mask_threshold, aug_cfg=None,
     )
     pin = device.type == 'cuda'
+    g = torch.Generator()
+    if seed is not None:
+        g.manual_seed(seed)
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
                               shuffle=True, num_workers=num_workers,
-                              drop_last=True, pin_memory=pin)
+                              drop_last=True, pin_memory=pin,
+                              worker_init_fn=_worker_init_fn, generator=g)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size,
                               shuffle=False, num_workers=num_workers,
                               drop_last=False, pin_memory=pin)

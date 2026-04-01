@@ -68,6 +68,11 @@ def build_trial_cfg(trial: optuna.Trial, base_cfg: dict, tune_cfg: dict) -> dict
     cfg = copy.deepcopy(base_cfg)
     ss  = tune_cfg['search_space']
 
+    # 每个 trial 使用不同但确定的种子：base_seed + trial_number
+    base_seed = base_cfg['train'].get('seed', 42)
+    if base_seed is not None:
+        cfg['train']['seed'] = base_seed + trial.number
+
     # 训练超参数
     cfg['train']['lr']            = trial.suggest_float('lr',    *ss['lr'],    log=True)
     cfg['train']['adam_betas'][0] = trial.suggest_float('beta1', *ss['beta1'])

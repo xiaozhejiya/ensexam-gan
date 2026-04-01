@@ -15,7 +15,7 @@ loss:
 
   lambda_lr: 1.0              # LR Loss 总缩放系数
   lambda_p: 0.05              # 感知损失（VGG 特征 L1）权重，太大会模糊
-  lambda_style: 120           # 风格损失（Gram 矩阵）权重，控制纹理一致性
+  lambda_style: 0.01           # 风格损失（Gram 矩阵）权重，控制纹理一致性
   lambda_sn: 1.0              # SN Loss 权重，监督软笔画掩码 Ms 的精度
   lambda_b: 0.4               # Block Loss 权重，监督文本块掩码 Mb（Dice Loss）
 
@@ -30,7 +30,8 @@ train:
   save_every_n_epochs: 3      # 每隔多少 epoch 保存一次 checkpoint
   save_dir: ./ensexam_checkpoints
   resume: true              # 是否从 resume_path 断点续训
-  resume_path: ./reptile_checkpoints\reptile_meta_init.pth
+  resume_path: ./ensexam_checkpoints/latest.pth
+  seed: 42                  # 全局随机种子，固定后训练可复现；设为 null 则不固定
 
   # 学习率调度器
   scheduler:
@@ -61,8 +62,8 @@ data:
 # ── 早停 ───────────────────────────────────────────────────────────────────────
 early_stopping:
   enabled: true
-  patience: 10                # 连续多少 epoch 无改善后停止
-  min_delta: 0.001            # 认定为"有改善"的最小变化量（绝对值）
+  patience: 30                # 连续多少 epoch 无改善后停止
+  min_delta: 0.0001            # 认定为"有改善"的最小变化量（绝对值）
   mode: min                   # "min"（监控 loss）或 "max"（监控 PSNR 等）
 
 # ── 日志 ───────────────────────────────────────────────────────────────────────
@@ -96,7 +97,7 @@ tuning:
     lr: [1.0e-5, 1.0e-3]      # log scale，最影响收敛速度
     beta1: [0.3, 0.7]          # Adam β₁，GAN 训练对此敏感
     lambda_p: [0.01, 0.2]      # log scale，感知损失权重
-    lambda_style: [50, 300]    # log scale，风格损失权重
+    lambda_style: [0.001, 1]   # log scale，风格损失权重
     lambda_b: [0.1, 1.0]       # Block Loss（Dice）权重
 
 # ── W&B ────────────────────────────────────────────────────────────────────────

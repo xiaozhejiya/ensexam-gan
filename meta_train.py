@@ -20,6 +20,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -84,6 +85,16 @@ def meta_train(cfg: dict):
 
     log_dir = log_cfg.get('log_dir', './logs')
     logger  = setup_logger(log_dir)
+
+    seed = train_cfg.get('seed', None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        logger.info(f"随机种子已固定：{seed}")
 
     device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
               if train_cfg['device'] == 'auto' else torch.device(train_cfg['device']))
