@@ -6,6 +6,7 @@ __pycache__/
 # ── 模型权重 & Checkpoint ─────────────────────────────────────────────────────
 ensexam_checkpoints/
 reptile_checkpoints/
+checkpoints/
 .ipynb_checkpoints/
 
 
