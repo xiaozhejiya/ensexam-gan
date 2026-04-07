@@ -27,7 +27,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config_loader import load_config
+from config_loader import load_config, save_config
 from data.dataset import EnsExamRealDataset
 from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
@@ -35,10 +35,8 @@ from networks.generator import Generator
 from tools.reptile import ReptileMetaLearner
 
 
-def setup_logger(log_dir: str) -> logging.Logger:
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_path  = os.path.join(log_dir, f'meta_train_{timestamp}.log')
+def setup_logger(run_dir: str) -> logging.Logger:
+    log_path = os.path.join(run_dir, 'meta_train.log')
 
     logger = logging.getLogger('meta_train')
     logger.setLevel(logging.INFO)
@@ -81,10 +79,15 @@ def meta_train(cfg: dict):
     train_cfg   = cfg['train']
     data_cfg    = cfg['data']
     reptile_cfg = cfg['reptile']
-    log_cfg     = cfg.get('logging', {})
 
-    log_dir = log_cfg.get('log_dir', './logs')
-    logger  = setup_logger(log_dir)
+    # 创建本次运行目录
+    base_dir  = reptile_cfg.get('save_dir', './checkpoints')
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir   = os.path.join(base_dir, 'meta', timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    save_config(cfg, os.path.join(run_dir, 'config.yaml'))
+
+    logger = setup_logger(run_dir)
 
     seed = train_cfg.get('seed', None)
     if seed is not None:
@@ -127,14 +130,12 @@ def meta_train(cfg: dict):
 
     meta_learner = ReptileMetaLearner(G, D, criterion, device, cfg)
 
-    save_dir    = reptile_cfg.get('save_dir', './reptile_checkpoints')
-    os.makedirs(save_dir, exist_ok=True)
     meta_epochs = reptile_cfg['meta_epochs']
     save_every  = reptile_cfg.get('save_every_n_epochs', 10)
     log_every   = reptile_cfg.get('log_every_n_epochs', 10)
 
     # CSV 日志
-    csv_path = os.path.join(log_dir, 'meta_loss_history.csv')
+    csv_path = os.path.join(run_dir, 'meta_loss_history.csv')
     if not os.path.exists(csv_path):
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(['episode', 'loss_G', 'loss_D'])
@@ -169,13 +170,13 @@ def meta_train(cfg: dict):
             window_G = window_D = 0.0
 
         if (episode + 1) % save_every == 0 or episode == meta_epochs - 1:
-            path = os.path.join(save_dir, f'reptile_epoch_{episode + 1}.pth')
+            path = os.path.join(run_dir, f'reptile_epoch_{episode + 1}.pth')
             torch.save({'G_state_dict': G.state_dict(),
                         'D_state_dict': D.state_dict()}, path)
             logger.info(f"  checkpoint → {path}")
 
     # 保存供 train.py resume 使用的最终检查点
-    final_path = os.path.join(save_dir, 'reptile_meta_init.pth')
+    final_path = os.path.join(run_dir, 'reptile_meta_init.pth')
     torch.save({
         'epoch':        0,
         'G_state_dict': G.state_dict(),

@@ -18,6 +18,7 @@ import argparse
 import copy
 import os
 import sys
+from datetime import datetime
 
 import optuna
 import torch
@@ -32,7 +33,7 @@ try:
 except ImportError:
     _WANDB_AVAILABLE = False
 
-from config_loader import load_config
+from config_loader import load_config, save_config
 from train import train_ensexam
 
 # 屏蔽 Optuna 的 INFO 日志，避免刷屏
@@ -93,10 +94,6 @@ def build_trial_cfg(trial: optuna.Trial, base_cfg: dict, tune_cfg: dict) -> dict
     # W&B 由 tune.py 统一管理，每个 trial 内部不再创建 run
     cfg['wandb']['enabled'] = False
 
-    # 日志写到独立子目录，避免和主训练日志混淆
-    cfg['logging']['log_dir'] = os.path.join(
-        base_cfg['logging'].get('log_dir', './logs'), 'tuning'
-    )
     return cfg
 
 
@@ -154,10 +151,17 @@ def run_tuning(cfg: dict, resume: bool = False):
             "请先运行 python meta_train.py 完成 Reptile 元训练。"
         )
 
+    # 创建本次调优的根目录
+    base_dir     = cfg['train'].get('save_dir', './checkpoints')
+    tune_run_dir = os.path.join(base_dir, 'tune', datetime.now().strftime('%Y%m%d_%H%M%S'))
+    os.makedirs(tune_run_dir, exist_ok=True)
+    save_config(cfg, os.path.join(tune_run_dir, 'config.yaml'))
+
     print(f"调优起点权重：{init_path}")
     print(f"每 trial epoch 数：{tune_cfg['tune_epochs']}")
     print(f"计划 trial 总数：{tune_cfg['n_trials']}")
-    print(f"SQLite 存储：{tune_cfg['storage']}\n")
+    print(f"SQLite 存储：{tune_cfg['storage']}")
+    print(f"结果目录：{tune_run_dir}\n")
 
     # W&B：整个调优过程共用一个 run
     wb_run = None
@@ -178,13 +182,14 @@ def run_tuning(cfg: dict, resume: bool = False):
     # Objective
     def objective(trial: optuna.Trial) -> float:
         trial_cfg = build_trial_cfg(trial, cfg, tune_cfg)
+        trial_dir = os.path.join(tune_run_dir, f'trial_{trial.number:03d}')
         print(f"\n[Trial {trial.number}] "
               f"lr={trial.params['lr']:.2e}  "
               f"beta1={trial.params['beta1']:.3f}  "
               f"lambda_p={trial.params['lambda_p']:.3f}  "
               f"lambda_style={trial.params['lambda_style']:.1f}  "
               f"lambda_b={trial.params['lambda_b']:.3f}")
-        return train_ensexam(trial_cfg)
+        return train_ensexam(trial_cfg, run_dir=trial_dir)
 
     # 创建或恢复 study
     storage    = _build_storage(tune_cfg['storage'])

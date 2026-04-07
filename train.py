@@ -26,7 +26,7 @@ try:
 except ImportError:
     _WANDB_AVAILABLE = False
 
-from config_loader import load_config
+from config_loader import load_config, save_config
 from data.dataset import EnsExamRealDataset
 from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
@@ -96,11 +96,9 @@ class CUDAPrefetcher:
 
 # ── 日志初始化 ─────────────────────────────────────────────────────────────────
 
-def setup_logger(log_dir: str) -> logging.Logger:
-    """同时输出到控制台和文件，文件名含时间戳避免覆盖。"""
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_path = os.path.join(log_dir, f'train_{timestamp}.log')
+def setup_logger(run_dir: str) -> logging.Logger:
+    """同时输出到控制台和文件，日志写入 run 目录（目录名已含时间戳）。"""
+    log_path = os.path.join(run_dir, 'train.log')
 
     logger = logging.getLogger('train')
     logger.setLevel(logging.INFO)
@@ -207,17 +205,15 @@ def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> floa
 
 # ── 主训练函数 ─────────────────────────────────────────────────────────────────
 
-def train_ensexam(cfg: dict):
+def train_ensexam(cfg: dict, run_dir: str = None) -> float:
     train_cfg = cfg['train']
     data_cfg  = cfg['data']
     es_cfg    = cfg.get('early_stopping', {})
-    log_cfg   = cfg.get('logging', {})
 
     epochs      = train_cfg['epochs']
     batch_size  = train_cfg['batch_size']
     lr          = train_cfg['lr']
     adam_betas  = tuple(train_cfg['adam_betas'])
-    save_dir    = train_cfg['save_dir']
     resume      = train_cfg['resume']
     resume_path = train_cfg['resume_path']
     num_workers = train_cfg['num_workers']
@@ -228,9 +224,16 @@ def train_ensexam(cfg: dict):
     overlap        = data_cfg['overlap']
     mask_threshold = data_cfg['mask_threshold']
 
-    log_dir = log_cfg.get('log_dir', './logs')
-    logger  = setup_logger(log_dir)
-    csv_log = CSVLogger(log_dir)
+    # 创建本次运行目录（权重 / 日志 / config 快照统一存放）
+    if run_dir is None:
+        base_dir  = train_cfg.get('save_dir', './checkpoints')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir   = os.path.join(base_dir, 'ensexam', timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    save_config(cfg, os.path.join(run_dir, 'config.yaml'))
+
+    logger  = setup_logger(run_dir)
+    csv_log = CSVLogger(run_dir)
     wb_run  = init_wandb(cfg)
     wb_cfg  = cfg.get('wandb', {})
     log_img_every = wb_cfg.get('log_image_every_n_epochs', 5)
@@ -244,8 +247,6 @@ def train_ensexam(cfg: dict):
     device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
               if device_str == 'auto' else torch.device(device_str))
     logger.info(f"使用设备：{device}")
-
-    os.makedirs(save_dir, exist_ok=True)
 
     # 数据集
     train_dataset = EnsExamRealDataset(
@@ -417,12 +418,12 @@ def train_ensexam(cfg: dict):
             'avg_loss_D':   avg_D,
             'val_loss':     val_loss,
         }
-        torch.save(ckpt, os.path.join(save_dir, 'latest.pth'))
+        torch.save(ckpt, os.path.join(run_dir, 'latest.pth'))
         if scheduler_G is not None:
             scheduler_G.step()
             scheduler_D.step()
         if (epoch + 1) % save_every == 0 or epoch == epochs - 1:
-            path = os.path.join(save_dir, f'epoch_{epoch + 1}.pth')
+            path = os.path.join(run_dir, f'epoch_{epoch + 1}.pth')
             torch.save(ckpt, path)
             logger.info(f"已保存：{path}")
 
@@ -435,7 +436,7 @@ def train_ensexam(cfg: dict):
                 )
                 break
             if es.is_best:
-                torch.save(ckpt, os.path.join(save_dir, 'best.pth'))
+                torch.save(ckpt, os.path.join(run_dir, 'best.pth'))
                 logger.info(f"已更新最优模型 best.pth（val_loss={val_loss:.4f}）")
                 if wb_run is not None:
                     wandb.run.summary['best_val_loss'] = val_loss
