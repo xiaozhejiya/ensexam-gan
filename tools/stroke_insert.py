@@ -1,24 +1,33 @@
 """
-字迹插入增强工具：
+字迹插入增强工具，提供两种来源的笔迹插入方式：
 
-  insert_strokes : 在完整图像上提取纯净笔迹差分，插入到 Igt 的空白区域，仅修改 Iin。
+┌─────────────────────┬──────────────────────────────────────────────────────┐
+│ 函数                │ 说明                                                 │
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ insert_strokes      │ 从考卷自身提取笔迹（exam 模式）                      │
+│                     │ 原理：diff = clip(Igt − Iin, 0, 255)                │
+│                     │ 印刷题目在 Iin/Igt 中相同，相减归零，只剩墨迹贡献。 │
+│                     │ 需要 noise_threshold 过滤 GT 标注噪声。              │
+│                     │ 优点：风格与原卷完全一致；缺点：受数据集标注质量影响│
+├─────────────────────┼──────────────────────────────────────────────────────┤
+│ insert_strokes_     │ 从外部笔迹库加载（library 模式）                     │
+│ from_library        │ 原理：diff = clip(255 − 白底手写页面, 0, 255)        │
+│                     │ 背景纯白，diff 在背景处严格为 0，无题目噪声问题。    │
+│                     │ 支持缩放（scale_range）和变色（ink_color）增强。     │
+│                     │ 优点：纯净无噪声；缺点：需提前用 build_stroke_       │
+│                     │       library.py 准备笔迹库                         │
+└─────────────────────┴──────────────────────────────────────────────────────┘
 
-核心原理：
-  diff = clip(Igt − Iin, 0, 255)
-  印刷题目在 Iin 与 Igt 中完全相同，相减归零；差分中只剩墨迹使像素变暗的贡献。
-  因此 diff_patch 天然不含任何印刷内容，无需来源背景过滤或复杂 alpha 替换。
-
-插入公式：
+两种模式插入公式相同：
   Iin_new[dst] = clip(Iin[dst] − diff_patch, 0, 255)
-  等价于把墨迹的"变暗量"叠加到目标区域，背景颜色由目标区域自身决定。
-
-推荐在完整图像上调用（空白区域搜索范围更大，成功率更高）。
 """
 
 import random
+from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from tools.color_augment import _extract_stroke_alpha
 
@@ -123,6 +132,87 @@ def _extract_diff_patches(diff: np.ndarray,
     return patches
 
 
+# ── 笔迹库增强工具 ──────────────────────────────────────────────────────────────
+
+def _recolor_diff(diff: np.ndarray, ink_color: tuple) -> np.ndarray:
+    """
+    将灰色笔迹 diff patch 重染为指定墨水颜色。
+
+    原理：
+        diff 的每个像素代表"比白色暗多少"（0=背景，255=最深墨迹）。
+        归一化为透明度 alpha = diff_gray / 255，再按目标墨水颜色重建各通道：
+            diff_new[c] = (255 - ink_color[c]) * alpha
+
+    Args:
+        diff      : RGB uint8 (H, W, 3)，高值=深墨迹
+        ink_color : (R, G, B) 目标墨水颜色，如 (30, 60, 150) 深蓝
+
+    Returns:
+        RGB uint8 (H, W, 3)，重染后的 diff
+    """
+    alpha = diff.mean(axis=2) / 255.0                          # (H, W) 透明度
+    r, g, b = ink_color
+    diff_colored = np.stack([
+        (255 - r) * alpha,
+        (255 - g) * alpha,
+        (255 - b) * alpha,
+    ], axis=2)
+    return np.clip(diff_colored, 0, 255).astype(np.uint8)
+
+
+def _scale_diff(diff: np.ndarray, scale: float) -> np.ndarray:
+    """
+    对 diff patch 进行缩放。
+
+    Args:
+        diff  : RGB uint8 (H, W, 3)
+        scale : 缩放比例，如 0.8 缩小，1.2 放大
+
+    Returns:
+        RGB uint8，缩放后的 diff
+    """
+    h, w = diff.shape[:2]
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(diff, (new_w, new_h), interpolation=interp)
+
+
+def _random_ink_color() -> tuple:
+    """
+    随机生成笔迹颜色，兼顾考试常见用笔与增强多样性。
+
+    采样策略（参考 color_augment._random_vivid_color）：
+        50% 考试常见色：黑色系 / 深蓝 / 蓝色
+        50% 全色相随机：HSV 高饱和度随机采样，覆盖红/绿/紫等非常规颜色
+
+    Returns:
+        (R, G, B) tuple
+    """
+    if random.random() < 0.5:
+        # ── 考试常见色 ──
+        mode = random.random()
+        if mode < 0.4:
+            v = random.randint(10, 40)
+            return (v, v, v)                           # 黑色系
+        elif mode < 0.75:
+            return (random.randint(10, 50),
+                    random.randint(20, 80),
+                    random.randint(100, 180))           # 深蓝/蓝黑
+        else:
+            return (random.randint(30, 80),
+                    random.randint(80, 140),
+                    random.randint(180, 230))           # 蓝色
+    else:
+        # ── 全色相随机（高饱和度），同 _random_vivid_color ──
+        h = random.randint(0, 179)
+        s = random.randint(180, 255)
+        v = random.randint(80, 200)                    # 适当压暗，模拟真实墨迹
+        bgr = cv2.cvtColor(np.array([[[h, s, v]]], dtype=np.uint8),
+                            cv2.COLOR_HSV2BGR)[0, 0]
+        return (int(bgr[2]), int(bgr[1]), int(bgr[0]))
+
+
 # ── 公开接口 ────────────────────────────────────────────────────────────────────
 
 def insert_strokes(Iin: np.ndarray,
@@ -134,6 +224,7 @@ def insert_strokes(Iin: np.ndarray,
                    min_patch_peak: int = 60,
                    min_area: int = 500,
                    text_threshold: int = 210,
+                   margin: int = 30,
                    return_positions: bool = False):
     """
     从 class1 区域提取纯净笔迹差分，插入到 Igt 的空白区域，仅修改 Iin。
@@ -156,6 +247,8 @@ def insert_strokes(Iin: np.ndarray,
                           控制"只挑选墨色足够深的笔迹 patch"（建议 50~100）
         min_area        : 连通区域最小面积（全图建议 300~800）
         text_threshold  : 目标空白判定阈值：GT 灰度低于此值视为有内容（建议 200~225）
+        margin          : 内容区域外扩禁区（像素），确保插入字迹与题目/已有笔迹保持距离
+                          （建议 20~50）
         return_positions: 若为 True，额外返回 list of (y, x, ph, pw) 插入坐标
 
     Returns:
@@ -207,6 +300,10 @@ def insert_strokes(Iin: np.ndarray,
     # ── 4. 构建已有内容掩码（印刷文字 + 已有笔迹），插入时双重规避 ──────────────
     content_mask = _build_content_mask(Igt, text_threshold)
     content_mask = np.maximum(content_mask, binary)
+    # 向外膨胀 margin 像素，保证插入字迹与题目/已有笔迹保持安全距离
+    if margin > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (margin * 2 + 1, margin * 2 + 1))
+        content_mask = cv2.dilate(content_mask, k)
 
     # ── 5. 寻找空白位置并逐 patch 插入 ────────────────────────────────────────
     result    = Iin.astype(np.int16).copy()
@@ -230,8 +327,115 @@ def insert_strokes(Iin: np.ndarray,
         # 将墨迹"变暗量"叠加到目标区域（直接相减，目标背景保持原色）
         result[y:y+ph, x:x+pw] -= patch['diff'].astype(np.int16)
 
-        # 更新内容掩码，防止后续 patch 重叠
+        # 更新内容掩码，尽量避免后续 patch 与当前 patch 重叠。
+        # 注：_find_blank_positions 基于随机采样而非穷举，极少数情况下仍可能出现
+        # 轻微重叠，属于正常现象——实际考卷中学生字迹本身也存在笔画交叠。
         new_stroke = (patch['diff'].mean(axis=2) > noise_threshold).astype(np.uint8)
+        content_mask[y:y+ph, x:x+pw] = np.maximum(
+            content_mask[y:y+ph, x:x+pw], new_stroke)
+
+        positions.append((y, x, ph, pw))
+        inserted += 1
+
+    Iin_new = np.clip(result, 0, 255).astype(np.uint8)
+    return (Iin_new, positions) if return_positions else Iin_new
+
+
+def insert_strokes_from_library(
+        Iin: np.ndarray,
+        Igt: np.ndarray,
+        library_dir: str,
+        n_insert: int = 5,
+        scale_range: tuple = (0.7, 1.3),
+        ink_color = 'random',
+        text_threshold: int = 210,
+        margin: int = 30,
+        return_positions: bool = False):
+    """
+    从笔迹库（build_stroke_library.py 生成的 patches/ 目录）随机抽取 diff patch，
+    施加缩放和变色增强后插入到 Igt 的空白区域，仅修改 Iin。
+
+    插入公式：
+        Iin_new[dst] = clip(Iin[dst] − diff_patch, 0, 255)
+
+    与 insert_strokes 相比，此函数使用外部纯净笔迹库，
+    完全避免考卷差分中题目噪声的干扰，无需 noise_threshold / min_patch_peak。
+
+    Args:
+        Iin            : 含笔迹原图，RGB uint8 (H, W, 3)
+        Igt            : 干净底图，  RGB uint8 (H, W, 3)
+        library_dir    : 笔迹库 patches 目录路径（含 *.png diff 文件）
+        n_insert       : 最多插入的笔迹数量（建议 3~8）
+        scale_range    : 缩放范围 (min_scale, max_scale)，如 (0.7, 1.3)
+        ink_color      : 墨水颜色，支持：
+                           'random' → 每次随机采样考试场景颜色（黑/深蓝/蓝）
+                           (R, G, B) → 固定颜色
+                           None     → 保留 patch 原始颜色，不重染
+        text_threshold : 目标空白判定阈值（建议 200~225）
+        margin         : 内容区域外扩禁区（像素），确保插入字迹与题目保持距离（建议 20~50）
+        return_positions: 若为 True，额外返回 list of (y, x, ph, pw)
+
+    Returns:
+        Iin_new          : RGB uint8 (H, W, 3)
+        positions (可选) : list of (y, x, ph, pw)
+    """
+    # ── 1. 加载笔迹库文件列表 ──────────────────────────────────────────────────
+    lib_path = Path(library_dir)
+    patch_files = sorted(lib_path.glob('*.png'))
+    if not patch_files:
+        return (Iin.copy(), []) if return_positions else Iin.copy()
+
+    # ── 2. 随机抽取并施加增强 ─────────────────────────────────────────────────
+    candidates = random.choices(patch_files, k=n_insert * 3)
+    patches = []
+    for fpath in candidates:
+        diff = np.array(Image.open(fpath).convert('RGB'))
+
+        # 缩放
+        scale = random.uniform(*scale_range)
+        diff  = _scale_diff(diff, scale)
+
+        # 变色
+        if ink_color == 'random':
+            color = _random_ink_color()
+            diff  = _recolor_diff(diff, color)
+        elif ink_color is not None:
+            diff = _recolor_diff(diff, ink_color)
+        # ink_color=None 时保留原色
+
+        patches.append(diff)
+
+    # ── 3. 构建内容掩码（印刷文字区域），插入时规避 ───────────────────────────
+    content_mask = _build_content_mask(Igt, text_threshold)
+    # 向外膨胀 margin 像素，保证插入字迹与题目/已有笔迹保持安全距离
+    if margin > 0:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (margin * 2 + 1, margin * 2 + 1))
+        content_mask = cv2.dilate(content_mask, k)
+
+    # ── 4. 寻找空白位置并逐 patch 插入 ────────────────────────────────────────
+    result    = Iin.astype(np.int16).copy()
+    positions = []
+    inserted  = 0
+
+    for diff in patches:
+        if inserted >= n_insert:
+            break
+
+        ph, pw = diff.shape[:2]
+        pos_list = _find_blank_positions(
+            Igt, ph, pw, content_mask,
+            text_threshold=text_threshold)
+
+        if not pos_list:
+            continue
+
+        y, x = random.choice(pos_list)
+        result[y:y+ph, x:x+pw] -= diff.astype(np.int16)
+
+        # 更新内容掩码，尽量避免后续 patch 与当前 patch 重叠。
+        # 注：极少数情况下仍可能出现轻微重叠，属于正常现象——
+        # 实际考卷中学生字迹本身也存在笔画交叠。
+        new_stroke = (diff.mean(axis=2) > 10).astype(np.uint8)
         content_mask[y:y+ph, x:x+pw] = np.maximum(
             content_mask[y:y+ph, x:x+pw], new_stroke)
 
