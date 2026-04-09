@@ -61,6 +61,7 @@ LIBRARY_DIR    = r"data/stroke_library/数学/patches"  # patches 目录路径
 LIBRARY_PARAMS = dict(
     n_insert       = 10,         # 最多插入多少个笔迹 patch
     scale_range    = (0.7, 1.3), # 缩放范围（相对于原 patch 尺寸）
+    angle_range    = (-15, 15),  # 旋转角度范围（度），None=不旋转
     ink_color      = 'random',   # 'random'=随机考试笔色 | (R,G,B)=固定色 | None=保留原色
     text_threshold = 210,        # 目标空白判定灰度阈值
     margin         = 30,         # 内容区域外扩禁区（像素），保证字迹与题目保持距离（建议 20~50）

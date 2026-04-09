@@ -178,6 +178,39 @@ def _scale_diff(diff: np.ndarray, scale: float) -> np.ndarray:
     return cv2.resize(diff, (new_w, new_h), interpolation=interp)
 
 
+def _rotate_diff(diff: np.ndarray, angle: float) -> np.ndarray:
+    """
+    对 diff patch 进行旋转，自动扩展画布以容纳旋转后内容。
+
+    旋转后的空白区域填充 0（无墨迹贡献），不引入伪笔迹。
+
+    Args:
+        diff  : RGB uint8 (H, W, 3)
+        angle : 旋转角度（度），正值逆时针，负值顺时针
+
+    Returns:
+        RGB uint8，旋转后的 diff（画布自动扩展）
+    """
+    h, w = diff.shape[:2]
+    cx, cy = w / 2.0, h / 2.0
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+
+    # 计算旋转后的新画布尺寸，避免角落被裁掉
+    cos = abs(M[0, 0])
+    sin = abs(M[0, 1])
+    new_w = int(h * sin + w * cos)
+    new_h = int(h * cos + w * sin)
+
+    # 平移旋转中心到新画布中心
+    M[0, 2] += new_w / 2.0 - cx
+    M[1, 2] += new_h / 2.0 - cy
+
+    return cv2.warpAffine(diff, M, (new_w, new_h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT,
+                          borderValue=(0, 0, 0))
+
+
 def _random_ink_color() -> tuple:
     """
     随机生成笔迹颜色，兼顾考试常见用笔与增强多样性。
@@ -347,13 +380,14 @@ def insert_strokes_from_library(
         library_dir: str,
         n_insert: int = 5,
         scale_range: tuple = (0.7, 1.3),
+        angle_range: tuple = (-15, 15),
         ink_color = 'random',
         text_threshold: int = 210,
         margin: int = 30,
         return_positions: bool = False):
     """
     从笔迹库（build_stroke_library.py 生成的 patches/ 目录）随机抽取 diff patch，
-    施加缩放和变色增强后插入到 Igt 的空白区域，仅修改 Iin。
+    施加缩放、旋转和变色增强后插入到 Igt 的空白区域，仅修改 Iin。
 
     插入公式：
         Iin_new[dst] = clip(Iin[dst] − diff_patch, 0, 255)
@@ -367,6 +401,8 @@ def insert_strokes_from_library(
         library_dir    : 笔迹库 patches 目录路径（含 *.png diff 文件）
         n_insert       : 最多插入的笔迹数量（建议 3~8）
         scale_range    : 缩放范围 (min_scale, max_scale)，如 (0.7, 1.3)
+        angle_range    : 旋转角度范围 (min_deg, max_deg)，如 (-15, 15)；
+                         None 表示不旋转
         ink_color      : 墨水颜色，支持：
                            'random' → 每次随机采样考试场景颜色（黑/深蓝/蓝）
                            (R, G, B) → 固定颜色
@@ -394,6 +430,11 @@ def insert_strokes_from_library(
         # 缩放
         scale = random.uniform(*scale_range)
         diff  = _scale_diff(diff, scale)
+
+        # 旋转（画布自动扩展，空白区域填 0 不引入伪笔迹）
+        if angle_range is not None:
+            angle = random.uniform(*angle_range)
+            diff  = _rotate_diff(diff, angle)
 
         # 变色
         if ink_color == 'random':
