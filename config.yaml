@@ -47,6 +47,7 @@ data:
   img_size: 512               # 裁剪块大小，模型固定输入尺寸
   overlap: 0                  # 滑动裁剪重叠像素，设为 128 可增加训练样本量
   mask_threshold: 20          # 生成掩码时判断像素差异的阈值（0~255），越小掩码越密
+  val_ratio: 0.1              # 从训练集按图像粒度划出的验证比例（0 = 使用 test 目录）
 
   # 数据增强（albumentations）；注释掉整个 augmentation 节可完全关闭增强
   augmentation:
@@ -63,8 +64,8 @@ data:
 early_stopping:
   enabled: true
   patience: 30                # 连续多少 epoch 无改善后停止
-  min_delta: 0.0001            # 认定为"有改善"的最小变化量（绝对值）
-  mode: min                   # "min"（监控 loss）或 "max"（监控 PSNR 等）
+  min_delta: 0.01             # PSNR 至少提升 0.01 dB 才算显著改善
+  mode: max                   # PSNR 越大越好
 
 # ── Reptile 元训练 ─────────────────────────────────────────────────────────────
 # 运行 meta_train.py 使用；train.py 二次训练时忽略此节
@@ -82,8 +83,8 @@ reptile:
 
 # ── 超参数调优（Optuna） ────────────────────────────────────────────────────────
 tuning:
-  n_trials: 50                          # 总共跑多少个 trial
-  tune_epochs: 5                        # 每个 trial 跑几个 epoch
+  n_trials: 100                          # 总共跑多少个 trial
+  tune_epochs: 10                        # 每个 trial 跑几个 epoch
   init_weights: ./reptile_checkpoints/reptile_meta_init.pth  # 每个 trial 的起点权重
   storage: sqlite:///tuning.db          # SQLite 持久化，支持断点续调
   study_name: ensexam_finetune

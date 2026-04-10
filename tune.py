@@ -197,7 +197,7 @@ def run_tuning(cfg: dict, resume: bool = False):
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
-        direction='minimize',
+        direction='maximize',    # 监控 PSNR，越大越好
         load_if_exists=True,     # resume=True 时续调，False 时若已存在也不报错
         sampler=optuna.samplers.TPESampler(seed=42),
         pruner=optuna.pruners.MedianPruner(
