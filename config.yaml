@@ -26,6 +26,7 @@ train:
   lr: 7.70e-4                 # Adam 初始学习率（trial #37 最优）
   adam_betas: [0.3037, 0.9]   # Adam 动量参数（beta1 由 trial #37 调优，beta2 保持 0.9）
   device: auto                # "auto" 自动选择 cuda/cpu，也可手动指定 "cuda:0"
+  gpu_ids: null               # null=单卡自动，[0,1] 开启 DataParallel 多卡训练
   num_workers: 0              # DataLoader 子进程数，Windows 下必须为 0
   save_every_n_epochs: 3      # 每隔多少 epoch 保存一次 checkpoint
   save_dir: ./checkpoints       # checkpoints/ensexam/YYYYMMDD_HHMMSS/ 的根目录

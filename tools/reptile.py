@@ -16,6 +16,7 @@ import torch
 from torch import optim
 
 from losses.losses import EnsExamLoss
+from train import unwrap_model
 
 
 class ReptileMetaLearner:
@@ -45,8 +46,8 @@ class ReptileMetaLearner:
             (G_task_state, D_task_state): 训练后的 state_dict 深拷贝
         """
         # 1. 保存 meta 参数快照
-        G_meta_state = copy.deepcopy(self.G.state_dict())
-        D_meta_state = copy.deepcopy(self.D.state_dict())
+        G_meta_state = copy.deepcopy(unwrap_model(self.G).state_dict())
+        D_meta_state = copy.deepcopy(unwrap_model(self.D).state_dict())
 
         # 2. 在 meta 模型上直接创建 inner 优化器（参数是正常叶节点）
         opt_G = optim.Adam(self.G.parameters(), lr=self.inner_lr, betas=self.adam_betas)
@@ -87,18 +88,19 @@ class ReptileMetaLearner:
             opt_G.step()
 
         # 3. 记录 inner 训练后的参数
-        G_task_state = copy.deepcopy(self.G.state_dict())
-        D_task_state = copy.deepcopy(self.D.state_dict())
+        G_task_state = copy.deepcopy(unwrap_model(self.G).state_dict())
+        D_task_state = copy.deepcopy(unwrap_model(self.D).state_dict())
 
         # 4. 还原 meta 参数，准备下一个 task
-        self.G.load_state_dict(G_meta_state)
-        self.D.load_state_dict(D_meta_state)
+        unwrap_model(self.G).load_state_dict(G_meta_state)
+        unwrap_model(self.D).load_state_dict(D_meta_state)
 
         return G_task_state, D_task_state, loss_G.item(), loss_D.item()
 
     def _reptile_update(self, model: torch.nn.Module, task_states: list):
         """θ_meta += ε · mean(θ_task_i − θ_meta)，只更新浮点参数。"""
-        meta_state = model.state_dict()
+        raw = unwrap_model(model)
+        meta_state = raw.state_dict()
         for key in meta_state:
             if not meta_state[key].is_floating_point():
                 continue  # 跳过 BatchNorm running_mean 等整数 buffer
@@ -106,7 +108,7 @@ class ReptileMetaLearner:
                 [s[key].to(self.device) - meta_state[key] for s in task_states]
             ).mean(0)
             meta_state[key] = meta_state[key] + self.meta_lr * delta
-        model.load_state_dict(meta_state)
+        raw.load_state_dict(meta_state)
 
     def run_episode(self, task_loaders: list) -> dict:
         """对每个 task 做 inner loop，再做 Reptile outer update。

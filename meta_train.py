@@ -33,6 +33,7 @@ from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
 from networks.generator import Generator
 from tools.reptile import ReptileMetaLearner
+from train import setup_device, wrap_model, unwrap_model
 
 
 def setup_logger(run_dir: str) -> logging.Logger:
@@ -99,9 +100,11 @@ def meta_train(cfg: dict):
         torch.backends.cudnn.benchmark = False
         logger.info(f"随机种子已固定：{seed}")
 
-    device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-              if train_cfg['device'] == 'auto' else torch.device(train_cfg['device']))
-    logger.info(f"使用设备：{device}")
+    device, gpu_ids = setup_device(train_cfg)
+    if len(gpu_ids) > 1:
+        logger.info(f"多卡训练：GPU {gpu_ids}，主设备 {device}")
+    else:
+        logger.info(f"使用设备：{device}")
 
     # 数据集
     dataset = EnsExamRealDataset(
@@ -123,10 +126,12 @@ def meta_train(cfg: dict):
             f"可用 task 数 ({len(task_loaders)}) < n_tasks_per_episode ({n_tasks_per_ep})"
         )
 
-    # 模型
+    # 模型（Reptile 的 inner loop 需要操作 state_dict，wrap 后传入 ReptileMetaLearner）
     G         = Generator(cfg=cfg['model']).to(device)
     D         = Discriminator().to(device)
     criterion = EnsExamLoss(cfg=cfg['loss']).to(device)
+    G         = wrap_model(G, gpu_ids)
+    D         = wrap_model(D, gpu_ids)
 
     meta_learner = ReptileMetaLearner(G, D, criterion, device, cfg)
 

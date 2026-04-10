@@ -16,6 +16,7 @@ from datetime import datetime
 
 import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from pytorch_msssim import ms_ssim as compute_ms_ssim
@@ -54,6 +55,39 @@ def _worker_init_fn(worker_id: int):
     seed = torch.initial_seed() % (2 ** 32)
     random.seed(seed + worker_id)
     np.random.seed(seed + worker_id)
+
+
+def setup_device(train_cfg: dict):
+    """
+    解析 gpu_ids 配置，返回 (primary_device, gpu_ids_list)。
+    gpu_ids_list 长度 > 1 时启用 DataParallel；长度 == 1 时单卡；空列表表示 CPU。
+    """
+    if not torch.cuda.is_available():
+        return torch.device('cpu'), []
+
+    gpu_ids = train_cfg.get('gpu_ids', None)
+    if gpu_ids:
+        ids = [int(i) for i in gpu_ids]
+        return torch.device(f'cuda:{ids[0]}'), ids
+
+    # 退回到 device 字段
+    device_str = train_cfg.get('device', 'auto')
+    if device_str == 'auto':
+        return torch.device('cuda:0'), [0]
+    idx = int(device_str.split(':')[1]) if ':' in device_str else 0
+    return torch.device(device_str), [idx]
+
+
+def wrap_model(model: nn.Module, gpu_ids: list) -> nn.Module:
+    """多 GPU 时用 DataParallel 包裹模型，单 GPU/CPU 直接返回。"""
+    if len(gpu_ids) > 1:
+        return nn.DataParallel(model, device_ids=gpu_ids)
+    return model
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """取出 DataParallel 内层模型，用于 state_dict 的保存与加载。"""
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 class CUDAPrefetcher:
@@ -287,10 +321,11 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
         set_seed(seed)
         logger.info(f"随机种子已固定：{seed}")
 
-    device_str = train_cfg['device']
-    device = (torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-              if device_str == 'auto' else torch.device(device_str))
-    logger.info(f"使用设备：{device}")
+    device, gpu_ids = setup_device(train_cfg)
+    if len(gpu_ids) > 1:
+        logger.info(f"多卡训练：GPU {gpu_ids}，主设备 {device}")
+    else:
+        logger.info(f"使用设备：{device}")
 
     # 数据集
     val_ratio = data_cfg.get('val_ratio', 0.0)
@@ -350,6 +385,7 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
     D = Discriminator().to(device)
     criterion = EnsExamLoss(cfg=cfg['loss']).to(device)
 
+    # optimizer 在 wrap 前创建，持有原始参数引用，DataParallel 不影响参数地址
     optimizer_G = optim.Adam(G.parameters(), lr=lr, betas=adam_betas)
     optimizer_D = optim.Adam(D.parameters(), lr=lr, betas=adam_betas)
 
@@ -380,13 +416,12 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
         )
         logger.info(f"早停已启用：patience={es.patience}, min_delta={es.min_delta}")
 
-    # 断点续训
+    # 断点续训（在 DataParallel wrap 之前加载，避免 module. 前缀问题）
     start_epoch = 0
     if resume and os.path.exists(resume_path):
         ckpt = torch.load(resume_path, map_location=device)
         G.load_state_dict(ckpt['G_state_dict'])
         D.load_state_dict(ckpt['D_state_dict'])
-        # reptile_meta_init.pth 的 optimizer 为空 dict，跳过以避免报错
         if ckpt.get('optimizer_G'):
             optimizer_G.load_state_dict(ckpt['optimizer_G'])
         if ckpt.get('optimizer_D'):
@@ -397,6 +432,10 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
             scheduler_D.load_state_dict(ckpt['scheduler_D'])
         start_epoch = ckpt['epoch']
         logger.info(f"断点续训：从第 {start_epoch} epoch 恢复")
+
+    # DataParallel wrap（checkpoint 加载完成后再 wrap）
+    G = wrap_model(G, gpu_ids)
+    D = wrap_model(D, gpu_ids)
 
     # 训练循环
     train_prefetcher = CUDAPrefetcher(train_loader, device)
@@ -491,8 +530,8 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
         # 保存 checkpoint（先存再 step，确保 lr 与本 epoch 对应）
         ckpt = {
             'epoch': epoch + 1,
-            'G_state_dict': G.state_dict(),
-            'D_state_dict': D.state_dict(),
+            'G_state_dict': unwrap_model(G).state_dict(),
+            'D_state_dict': unwrap_model(D).state_dict(),
             'optimizer_G':  optimizer_G.state_dict(),
             'optimizer_D':  optimizer_D.state_dict(),
             'scheduler_G':  scheduler_G.state_dict() if scheduler_G else None,
