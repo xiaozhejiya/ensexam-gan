@@ -57,7 +57,7 @@ def extract_patches(page_img: np.ndarray,
                     ink_threshold: int  = 200,
                     min_area: int       = 2000,
                     max_area: int       = 500_000,
-                    pad: int            = 20,
+                    pad: int            = 5,
                     dilate_ksize: int   = 80,
                     tight_bbox: bool    = True) -> list:
     """
