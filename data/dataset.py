@@ -43,7 +43,14 @@ class EnsExamRealDataset(Dataset):
                  is_train: bool = True,
                  overlap: int = 0,
                  mask_threshold: int = 20,
-                 aug_cfg: dict = None):
+                 aug_cfg: dict = None,
+                 file_list: list = None):
+        """
+        Args:
+            file_list: 指定使用的图像文件名列表（仅文件名，不含路径）。
+                       为 None 时使用对应 split 目录下的全部图像。
+                       用于从训练集中划分验证子集时传入不同的文件列表。
+        """
         self.data_root = data_root
         self.img_size = img_size
         self.is_train = is_train
@@ -65,6 +72,7 @@ class EnsExamRealDataset(Dataset):
         self.gt_dir   = os.path.join(data_root, split, "all_labels")
         self.box_dir  = os.path.join(data_root, split, "box_label_txt")
         self.has_boxes = os.path.isdir(self.box_dir)
+        self._file_list = file_list  # None 表示使用全部文件
 
         self.patch_index_map = []
         self._build_patch_index()
@@ -72,7 +80,10 @@ class EnsExamRealDataset(Dataset):
     def _build_patch_index(self):
         """扫描数据集，构建 patch 索引表（支持大图滑动裁剪）。"""
         valid_ext = (".png", ".jpg", ".jpeg")
-        all_files = [f for f in os.listdir(self.img_dir) if f.endswith(valid_ext)]
+        if self._file_list is not None:
+            all_files = [f for f in self._file_list if f.endswith(valid_ext)]
+        else:
+            all_files = [f for f in os.listdir(self.img_dir) if f.endswith(valid_ext)]
 
         print(f"正在扫描数据集，构建裁剪索引 (overlap={self.overlap})...")
         for fname in all_files:
