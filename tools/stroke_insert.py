@@ -211,6 +211,46 @@ def _rotate_diff(diff: np.ndarray, angle: float) -> np.ndarray:
                           borderValue=(0, 0, 0))
 
 
+def _compute_rotated_corners(orig_h: int, orig_w: int, angle: float,
+                              insert_y: int, insert_x: int) -> np.ndarray:
+    """
+    计算旋转后 patch 四角在目标图像中的坐标（用于写入四边形标注）。
+
+    角点顺序与 _rotate_diff 保持一致：左上→右上→右下→左下（原始 patch 坐标系）。
+    旋转矩阵与 _rotate_diff 完全相同，保证坐标一致性。
+
+    Args:
+        orig_h/orig_w : 旋转前 patch 的高宽（缩放后、旋转前）
+        angle         : 旋转角度（度），与传给 _rotate_diff 的值相同
+        insert_y/x    : patch 插入到目标图像的起点（左上角）坐标
+
+    Returns:
+        corners : int32 (4, 2)，每行为 (x, y) 图像坐标
+    """
+    cx, cy = orig_w / 2.0, orig_h / 2.0
+    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
+
+    cos   = abs(M[0, 0])
+    sin   = abs(M[0, 1])
+    new_w = int(orig_h * sin + orig_w * cos)
+    new_h = int(orig_h * cos + orig_w * sin)
+
+    M[0, 2] += new_w / 2.0 - cx
+    M[1, 2] += new_h / 2.0 - cy
+
+    # 原始 patch 四角 (x, y)：左上→右上→右下→左下
+    corners_src = np.array(
+        [[0, 0], [orig_w, 0], [orig_w, orig_h], [0, orig_h]],
+        dtype=np.float32,
+    )
+    corners_rot = cv2.transform(corners_src.reshape(1, -1, 2), M).reshape(-1, 2)
+
+    # 平移到插入位置
+    corners_rot[:, 0] += insert_x
+    corners_rot[:, 1] += insert_y
+    return corners_rot.astype(np.int32)
+
+
 def _random_ink_color() -> tuple:
     """
     随机生成笔迹颜色，兼顾考试常见用笔与增强多样性。
@@ -367,7 +407,8 @@ def insert_strokes(Iin: np.ndarray,
         content_mask[y:y+ph, x:x+pw] = np.maximum(
             content_mask[y:y+ph, x:x+pw], new_stroke)
 
-        positions.append((y, x, ph, pw))
+        # exam 模式无旋转，corners=None，使用轴对齐矩形表示
+        positions.append({'y': y, 'x': x, 'ph': ph, 'pw': pw, 'corners': None})
         inserted += 1
 
     Iin_new = np.clip(result, 0, 255).astype(np.uint8)
@@ -431,7 +472,11 @@ def insert_strokes_from_library(
         scale = random.uniform(*scale_range)
         diff  = _scale_diff(diff, scale)
 
+        # 记录旋转前尺寸（用于事后计算旋转四边形角点）
+        pre_rot_h, pre_rot_w = diff.shape[:2]
+
         # 旋转（画布自动扩展，空白区域填 0 不引入伪笔迹）
+        angle = 0.0
         if angle_range is not None:
             angle = random.uniform(*angle_range)
             diff  = _rotate_diff(diff, angle)
@@ -444,7 +489,8 @@ def insert_strokes_from_library(
             diff = _recolor_diff(diff, ink_color)
         # ink_color=None 时保留原色
 
-        patches.append(diff)
+        patches.append({'diff': diff, 'pre_rot_h': pre_rot_h,
+                        'pre_rot_w': pre_rot_w, 'angle': angle})
 
     # ── 3. 构建内容掩码（印刷文字区域），插入时规避 ───────────────────────────
     content_mask = _build_content_mask(Igt, text_threshold)
@@ -458,10 +504,11 @@ def insert_strokes_from_library(
     positions = []
     inserted  = 0
 
-    for diff in patches:
+    for p in patches:
         if inserted >= n_insert:
             break
 
+        diff = p['diff']
         ph, pw = diff.shape[:2]
         pos_list = _find_blank_positions(
             Igt, ph, pw, content_mask,
@@ -480,7 +527,10 @@ def insert_strokes_from_library(
         content_mask[y:y+ph, x:x+pw] = np.maximum(
             content_mask[y:y+ph, x:x+pw], new_stroke)
 
-        positions.append((y, x, ph, pw))
+        # 计算旋转四边形角点（用于写入 box 标注）
+        corners = _compute_rotated_corners(
+            p['pre_rot_h'], p['pre_rot_w'], p['angle'], y, x)
+        positions.append({'y': y, 'x': x, 'ph': ph, 'pw': pw, 'corners': corners})
         inserted += 1
 
     Iin_new = np.clip(result, 0, 255).astype(np.uint8)

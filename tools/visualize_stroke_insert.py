@@ -59,7 +59,7 @@ EXAM_PARAMS = dict(
 # ── library 模式参数（从外部笔迹库加载） ────────────────────────────────────────
 LIBRARY_DIR    = r"data/stroke_library/数学/patches"  # patches 目录路径
 LIBRARY_PARAMS = dict(
-    n_insert       = 10,         # 最多插入多少个笔迹 patch
+    n_insert       = 20,         # 最多插入多少个笔迹 patch
     scale_range    = (0.7, 1.3), # 缩放范围（相对于原 patch 尺寸）
     angle_range    = (-30, 30),  # 旋转角度范围（度），None=不旋转
     ink_color      = 'random',   # 'random'=随机考试笔色 | (R,G,B)=固定色 | None=保留原色
@@ -87,14 +87,24 @@ def scale_to_max_h(img: np.ndarray, max_h: int) -> np.ndarray:
 
 def draw_boxes(img: np.ndarray, positions: list, scale: float) -> np.ndarray:
     vis = img.copy()
-    for y, x, ph, pw in positions:
-        pt1 = (int(x * scale), int(y * scale))
-        pt2 = (int((x + pw) * scale), int((y + ph) * scale))
-        cv2.rectangle(vis, pt1, pt2, BOX_COLOR, BOX_THICKNESS)
+    for pos in positions:
+        corners = pos.get('corners')
+        if corners is not None:
+            # 旋转四边形：用 polylines 绘制
+            pts = (corners * scale).astype(np.int32)
+            cv2.polylines(vis, [pts], isClosed=True,
+                          color=BOX_COLOR, thickness=BOX_THICKNESS)
+        else:
+            # exam 模式无旋转，退化为轴对齐矩形
+            y, x, ph, pw = pos['y'], pos['x'], pos['ph'], pos['pw']
+            pt1 = (int(x * scale), int(y * scale))
+            pt2 = (int((x + pw) * scale), int((y + ph) * scale))
+            cv2.rectangle(vis, pt1, pt2, BOX_COLOR, BOX_THICKNESS)
     return vis
 
 
-def extract_zoom_crop(img: np.ndarray, y, x, ph, pw) -> np.ndarray:
+def extract_zoom_crop(img: np.ndarray, pos: dict) -> np.ndarray:
+    y, x, ph, pw = pos['y'], pos['x'], pos['ph'], pos['pw']
     H, W = img.shape[:2]
     y1 = max(0, y - ZOOM_PAD)
     x1 = max(0, x - ZOOM_PAD)
@@ -253,10 +263,10 @@ def main(mode='exam', n_samples=3, save_path=None, seed=SEED, files=None):
     # ══════════════════════════════════════════════════════════════════════════
     all_crops = []
     for data in results:
-        for k, (y, x, ph, pw) in enumerate(data['positions']):
+        for k, pos in enumerate(data['positions']):
             label     = f"{data['fname']}  #{k+1}"
-            crop_orig = extract_zoom_crop(data['Iin'],     y, x, ph, pw)
-            crop_aug  = extract_zoom_crop(data['Iin_aug'], y, x, ph, pw)
+            crop_orig = extract_zoom_crop(data['Iin'],     pos)
+            crop_aug  = extract_zoom_crop(data['Iin_aug'], pos)
             all_crops.append((label, crop_orig, crop_aug))
 
     if all_crops:
