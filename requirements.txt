@@ -10,6 +10,7 @@ numpy==1.21.6
 opencv-python
 Pillow==9.2.0
 albumentations
+pytorch-msssim             # MS-SSIM 指标计算
 PyMuPDF                # PDF 渲染，用于笔迹库构建（build_stroke_library.py）
 
 # ── 训练工具 ─────────────────────────────────────────────────────────────────

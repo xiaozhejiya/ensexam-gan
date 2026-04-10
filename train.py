@@ -8,14 +8,17 @@
 import argparse
 import csv
 import logging
+import math
 import os
 import random
 import sys
 from datetime import datetime
 
+import cv2
 import torch
 import torch.nn.functional as F
 import numpy as np
+from pytorch_msssim import ms_ssim as compute_ms_ssim
 from torch import optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -185,22 +188,63 @@ def log_images_to_wandb(G, val_loader, device, epoch):
 
 # ── 验证循环 ───────────────────────────────────────────────────────────────────
 
+_CROSS_KERNEL = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
+
+
 @torch.no_grad()
-def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> float:
+def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> dict:
     """
-    在验证集上计算平均重建损失（L1），不含 GAN 对抗项。
-    用 L1(Icomp, Igt) 作为早停指标：纯重建质量，不受判别器训练状态影响。
+    在验证集上计算全量图像质量指标：
+      PSNR、MS-SSIM、MSE、L1、AGE、pEPs、pCEPs
     """
     G.eval()
-    total_loss = 0.0
-    for Iin, _, Mb_gt, _, _, _, Igt in val_loader:
-        Iin, Mb_gt, Igt = Iin.to(device), Mb_gt.to(device), Igt.to(device)
+    sums = {'psnr': 0.0, 'ms_ssim': 0.0, 'mse': 0.0,
+            'l1': 0.0, 'age': 0.0, 'peps': 0.0, 'pceps': 0.0}
+    n_batches = 0
+    n_images  = 0
+
+    for Iin, _, _, _, _, _, Igt in val_loader:
+        Iin, Igt = Iin.to(device), Igt.to(device)
         *_, Icomp = G(Iin)
-        # 文本区域 L1 × 2 + 背景区域 L1（更关注笔画擦除质量）
-        total_loss += (2 * F.l1_loss(Icomp * Mb_gt, Igt * Mb_gt)
-                       + F.l1_loss(Icomp * (1 - Mb_gt), Igt * (1 - Mb_gt))).item()
+
+        # [-1,1] → [0,1]
+        pred = (Icomp.clamp(-1, 1) + 1) / 2
+        gt   = (Igt.clamp(-1, 1) + 1) / 2
+
+        # ── 批量指标 ──────────────────────────────────────────────
+        mse_val = F.mse_loss(pred, gt).item()
+        sums['mse']     += mse_val
+        sums['l1']      += F.l1_loss(pred, gt).item()
+        sums['psnr']    += (10 * math.log10(1.0 / mse_val) if mse_val > 1e-10 else 100.0)
+        sums['ms_ssim'] += compute_ms_ssim(pred, gt, data_range=1.0).item()
+
+        # ── 逐图灰度指标：AGE / pEPs / pCEPs ─────────────────────
+        pred_np = (pred.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+        gt_np   = (gt.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
+
+        for b in range(pred_np.shape[0]):
+            pred_g = cv2.cvtColor(pred_np[b], cv2.COLOR_RGB2GRAY).astype(np.int16)
+            gt_g   = cv2.cvtColor(gt_np[b],   cv2.COLOR_RGB2GRAY).astype(np.int16)
+            diff   = np.abs(pred_g - gt_g)
+
+            sums['age']  += diff.mean()
+            err_mask      = (diff > 20).astype(np.uint8)
+            sums['peps'] += err_mask.mean()
+            sums['pceps'] += cv2.erode(err_mask, _CROSS_KERNEL, iterations=1).mean()
+
+        n_batches += 1
+        n_images  += pred_np.shape[0]
+
     G.train()
-    return total_loss / len(val_loader)
+    return {
+        'psnr':    sums['psnr']    / n_batches,
+        'ms_ssim': sums['ms_ssim'] / n_batches,
+        'mse':     sums['mse']     / n_batches,
+        'l1':      sums['l1']      / n_batches,
+        'age':     sums['age']     / n_images,
+        'peps':    sums['peps']    / n_images,
+        'pceps':   sums['pceps']   / n_images,
+    }
 
 
 # ── 主训练函数 ─────────────────────────────────────────────────────────────────
@@ -249,15 +293,45 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
     logger.info(f"使用设备：{device}")
 
     # 数据集
-    train_dataset = EnsExamRealDataset(
-        data_root=data_root, img_size=img_size, is_train=True,
-        overlap=overlap, mask_threshold=mask_threshold,
-        aug_cfg=data_cfg.get('augmentation'),
-    )
-    val_dataset = EnsExamRealDataset(
-        data_root=data_root, img_size=img_size, is_train=False,
-        overlap=0, mask_threshold=mask_threshold, aug_cfg=None,
-    )
+    val_ratio = data_cfg.get('val_ratio', 0.0)
+    if val_ratio > 0:
+        # 按图像粒度从训练目录划分验证集，避免 patch 级泄漏
+        train_img_dir = os.path.join(data_root, 'train', 'all_images')
+        valid_ext = ('.png', '.jpg', '.jpeg')
+        all_train_files = sorted(
+            f for f in os.listdir(train_img_dir) if f.endswith(valid_ext)
+        )
+        rng = random.Random(seed if seed is not None else 42)
+        rng.shuffle(all_train_files)
+        n_val = max(1, int(len(all_train_files) * val_ratio))
+        val_files   = all_train_files[:n_val]
+        train_files = all_train_files[n_val:]
+        logger.info(
+            f"验证集从训练目录划分：共 {len(all_train_files)} 张图，"
+            f"训练 {len(train_files)} 张 / 验证 {len(val_files)} 张（val_ratio={val_ratio}）"
+        )
+        train_dataset = EnsExamRealDataset(
+            data_root=data_root, img_size=img_size, is_train=True,
+            overlap=overlap, mask_threshold=mask_threshold,
+            aug_cfg=data_cfg.get('augmentation'), file_list=train_files,
+        )
+        val_dataset = EnsExamRealDataset(
+            data_root=data_root, img_size=img_size, is_train=True,
+            overlap=0, mask_threshold=mask_threshold,
+            aug_cfg=None, file_list=val_files,
+        )
+    else:
+        # val_ratio=0：沿用旧行为，直接使用 test 目录
+        train_dataset = EnsExamRealDataset(
+            data_root=data_root, img_size=img_size, is_train=True,
+            overlap=overlap, mask_threshold=mask_threshold,
+            aug_cfg=data_cfg.get('augmentation'),
+        )
+        val_dataset = EnsExamRealDataset(
+            data_root=data_root, img_size=img_size, is_train=False,
+            overlap=0, mask_threshold=mask_threshold, aug_cfg=None,
+        )
+
     pin = device.type == 'cuda'
     g = torch.Generator()
     if seed is not None:
@@ -374,8 +448,8 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
         avg_parts = [p / n for p in epoch_parts]
 
         # 验证
-        val_loss = validate(G, val_loader, device)
-        best_val_loss = min(best_val_loss, val_loss)
+        val_m = validate(G, val_loader, device)
+        best_val_loss = min(best_val_loss, val_m['l1'])
 
         current_lr = optimizer_G.param_groups[0]['lr']
         logger.info(
@@ -383,9 +457,12 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
             f"Train G={avg_G:.4f}  D={avg_D:.4f} | "
             f"adv={avg_parts[0]:.4f}  rec={avg_parts[1]:.4f}  "
             f"per={avg_parts[2]:.4f}  style={avg_parts[3]:.4f} | "
-            f"Val L1={val_loss:.4f} | LR={current_lr:.2e}"
+            f"PSNR={val_m['psnr']:.2f}  MS-SSIM={val_m['ms_ssim']:.4f}  "
+            f"MSE={val_m['mse']:.6f}  AGE={val_m['age']:.2f}  "
+            f"pEPs={val_m['peps']:.4f}  pCEPs={val_m['pceps']:.4f} | "
+            f"LR={current_lr:.2e}"
         )
-        csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_loss)
+        csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_m['l1'])
 
         # W&B：上报数值指标
         if wb_run is not None:
@@ -398,7 +475,13 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
                 'train/style':      avg_parts[3],
                 'train/sn':         avg_parts[4],
                 'train/block':      avg_parts[5],
-                'val/l1_loss':      val_loss,
+                'val/psnr':         val_m['psnr'],
+                'val/ms_ssim':      val_m['ms_ssim'],
+                'val/mse':          val_m['mse'],
+                'val/l1':           val_m['l1'],
+                'val/age':          val_m['age'],
+                'val/peps':         val_m['peps'],
+                'val/pceps':        val_m['pceps'],
                 'train/lr':         current_lr,
             }, step=epoch + 1)
             # 每隔 N epoch 上传对比图
@@ -427,25 +510,25 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
             torch.save(ckpt, path)
             logger.info(f"已保存：{path}")
 
-        # 保存最优模型（由早停判定）
+        # 保存最优模型（由早停判定，监控 PSNR）
         if es is not None:
-            if es.step(val_loss, epoch + 1):
+            if es.step(val_m['psnr'], epoch + 1):
                 logger.info(
                     f"早停触发：连续 {es.patience} epoch 无改善，"
-                    f"最优 epoch={es.best_epoch}，val_loss={es.best_value:.4f}"
+                    f"最优 epoch={es.best_epoch}，PSNR={es.best_value:.2f}"
                 )
                 break
             if es.is_best:
                 torch.save(ckpt, os.path.join(run_dir, 'best.pth'))
-                logger.info(f"已更新最优模型 best.pth（val_loss={val_loss:.4f}）")
+                logger.info(f"已更新最优模型 best.pth（PSNR={val_m['psnr']:.2f}）")
                 if wb_run is not None:
-                    wandb.run.summary['best_val_loss'] = val_loss
-                    wandb.run.summary['best_epoch']    = epoch + 1
+                    wandb.run.summary['best_psnr']  = val_m['psnr']
+                    wandb.run.summary['best_epoch'] = epoch + 1
 
     if wb_run is not None:
         wandb.finish()
 
-    return best_val_loss
+    return es.best_value if es is not None else best_val_loss
 
 
 if __name__ == '__main__':
