@@ -114,6 +114,7 @@ def meta_train(cfg: dict):
         overlap        = data_cfg['overlap'],
         mask_threshold = data_cfg['mask_threshold'],
         aug_cfg        = data_cfg.get('augmentation'),
+        phase          = 'meta',
     )
 
     task_loaders   = build_task_loaders(dataset, train_cfg['batch_size'],

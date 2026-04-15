@@ -13,6 +13,14 @@ from torchvision import transforms
 
 from data.mask_utils import generate_mask_from_pair, generate_mb_from_boxes
 from data.augmentation import get_train_augmentation
+from tools.color_augment import (
+    create_class_mask,
+    recolor_stroke,
+    colorize_printed_text,
+    recolor_stroke_and_tint,
+    _random_vivid_color,
+)
+from tools.stroke_insert import insert_strokes, insert_strokes_from_library
 
 
 class EnsExamRealDataset(Dataset):
@@ -44,7 +52,8 @@ class EnsExamRealDataset(Dataset):
                  overlap: int = 0,
                  mask_threshold: int = 20,
                  aug_cfg: dict = None,
-                 file_list: list = None):
+                 file_list: list = None,
+                 phase: str = "train"):
         """
         Args:
             file_list: 指定使用的图像文件名列表（仅文件名，不含路径）。
@@ -57,6 +66,8 @@ class EnsExamRealDataset(Dataset):
         self.overlap = overlap
         self.mask_threshold = mask_threshold
         self.augment = (aug_cfg is not None) and is_train
+        self.aug_cfg = aug_cfg or {}
+        self.phase = phase
 
         if self.augment:
             self.aug = get_train_augmentation(aug_cfg)
@@ -76,6 +87,119 @@ class EnsExamRealDataset(Dataset):
 
         self.patch_index_map = []
         self._build_patch_index()
+
+    def _apply_domain_augment(self,
+                              Iin: np.ndarray,
+                              Igt: np.ndarray,
+                              box_txt_path: str) -> tuple:
+        """执行字迹/颜色领域增强，返回 (Iin_aug, Igt_aug)。"""
+        # 仅在 data.augmentation.domain_augment 配置存在时启用
+        if not self.augment:
+            return Iin, Igt
+        domain_cfg = self.aug_cfg.get('domain_augment', {})
+        if not domain_cfg.get('enabled', False):
+            return Iin, Igt
+
+        apply_on = set(domain_cfg.get('apply_on', ['train']))
+        if self.phase not in apply_on:
+            return Iin, Igt
+
+        p_all = float(domain_cfg.get('p', 1.0))
+        if np.random.rand() >= p_all:
+            return Iin, Igt
+
+        H, W = Iin.shape[:2]
+        class1_mask = class2_mask = None
+        if box_txt_path and os.path.exists(box_txt_path):
+            class1_mask = create_class_mask(box_txt_path, H, W, target_class=1)
+            class2_mask = create_class_mask(box_txt_path, H, W, target_class=2)
+
+        # 1) 颜色增强（先改原卷色彩，再做字迹插入，避免新插入字迹被二次改色）
+        color_cfg = domain_cfg.get('color_augment', {})
+        if color_cfg.get('enabled', False):
+            p_color = float(color_cfg.get('p', 0.5))
+            if np.random.rand() < p_color:
+                mode = color_cfg.get('mode', 'both')
+                stroke_params = color_cfg.get('stroke_params', {})
+                text_params = color_cfg.get('text_params', {})
+                if mode == 'stroke':
+                    stroke_color = stroke_params.get('stroke_color', None)
+                    if stroke_color == 'random' or stroke_color is None:
+                        stroke_color = _random_vivid_color()
+                    Iin = recolor_stroke(
+                        Iin, Igt,
+                        target_color=tuple(stroke_color),
+                        threshold=stroke_params.get('threshold', 15),
+                        norm_scale=stroke_params.get('norm_scale', 60.0),
+                        class1_mask=class1_mask,
+                        class2_mask=class2_mask,
+                    )
+                elif mode == 'text':
+                    Iin, Igt = colorize_printed_text(
+                        Iin, Igt,
+                        color_ratio=text_params.get('color_ratio', 0.25),
+                        n_colors=text_params.get('n_colors', 2),
+                        dilation_px=text_params.get('dilation_px', 15),
+                        min_area=text_params.get('min_area', 300),
+                        text_threshold=text_params.get('text_threshold', 180),
+                        stroke_threshold=stroke_params.get('threshold', 15),
+                        stroke_norm_scale=stroke_params.get('norm_scale', 60.0),
+                    )
+                else:  # both
+                    stroke_color = stroke_params.get('stroke_color', None)
+                    if stroke_color == 'random':
+                        stroke_color = None
+                    Iin, Igt = recolor_stroke_and_tint(
+                        Iin, Igt,
+                        stroke_color=stroke_color,
+                        color_ratio=text_params.get('color_ratio', 0.25),
+                        n_colors=text_params.get('n_colors', 2),
+                        dilation_px=text_params.get('dilation_px', 15),
+                        min_area=text_params.get('min_area', 300),
+                        text_threshold=text_params.get('text_threshold', 180),
+                        threshold=stroke_params.get('threshold', 15),
+                        norm_scale=stroke_params.get('norm_scale', 60.0),
+                        class1_mask=class1_mask,
+                        class2_mask=class2_mask,
+                    )
+
+        # 2) 字迹插入增强（后执行，确保插入字迹颜色保持插入策略本身的分布）
+        stroke_cfg = domain_cfg.get('stroke_insert', {})
+        if stroke_cfg.get('enabled', False):
+            p_stroke = float(stroke_cfg.get('p', 0.5))
+            if np.random.rand() < p_stroke:
+                mode = stroke_cfg.get('mode', 'library')
+                if mode == 'exam':
+                    exam_params = stroke_cfg.get('exam_params', {})
+                    Iin = insert_strokes(
+                        Iin, Igt,
+                        class1_mask=class1_mask,
+                        class2_mask=class2_mask,
+                        n_insert=exam_params.get('n_insert', 5),
+                        noise_threshold=exam_params.get('noise_threshold', 30),
+                        min_patch_peak=exam_params.get('min_patch_peak', 60),
+                        min_area=exam_params.get('min_area', 500),
+                        text_threshold=exam_params.get('text_threshold', 210),
+                        margin=exam_params.get('margin', 30),
+                        return_positions=False,
+                    )
+                elif mode == 'library':
+                    lib_params = stroke_cfg.get('library_params', {})
+                    library_dir = lib_params.get('library_dir', None)
+                    if library_dir:
+                        Iin = insert_strokes_from_library(
+                            Iin, Igt,
+                            library_dir=library_dir,
+                            n_insert=lib_params.get('n_insert', 5),
+                            scale_range=tuple(lib_params.get('scale_range', [0.7, 1.3])),
+                            angle_range=tuple(lib_params.get('angle_range', [-15, 15])),
+                            ink_color=lib_params.get('ink_color', 'random'),
+                            text_threshold=lib_params.get('text_threshold', 210),
+                            margin=lib_params.get('margin', 30),
+                            return_positions=False,
+                        )
+
+        return Iin, Igt
 
     def _build_patch_index(self):
         """扫描数据集，构建 patch 索引表（支持大图滑动裁剪）。"""
@@ -167,24 +291,30 @@ class EnsExamRealDataset(Dataset):
             _, Mb_float = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
             Mb_pre = (Mb_float > 0.5).astype(np.uint8)
 
-        # 4. 数据增强（Iin/Igt/Mb 施加相同的空间变换）
+        # 4. 领域增强（字迹插入 / 色彩增强）
+        Iin, Igt = self._apply_domain_augment(Iin, Igt, box_txt)
+        # 新增字迹后，用差值掩码补充 Mb，避免监督遗漏新增区域
+        _, Mb_from_aug = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
+        Mb_pre = np.maximum(Mb_pre, (Mb_from_aug > 0.5).astype(np.uint8))
+
+        # 5. albumentations 数据增强（Iin/Igt/Mb 施加相同的空间变换）
         if self.augment:
             result = self.aug(image=Iin, gt=Igt, mb=Mb_pre)
             Iin, Igt, Mb_pre = result['image'], result['gt'], result['mb']
 
-        # 5. 增强后从像素差值生成 Ms；Mb 直接用增强后的结果
+        # 6. 增强后从像素差值生成 Ms；Mb 直接用增强后的结果
         Ms_gt_np, _ = generate_mask_from_pair(Iin, Igt, threshold=self.mask_threshold)
         Mb_gt_np = Mb_pre.astype(np.float32)
 
-        # 5. 图像归一化到 [-1, 1]
+        # 7. 图像归一化到 [-1, 1]
         Iin = self.img_transform(Iin.copy())   # (3, H, W)
         Igt = self.img_transform(Igt.copy())   # (3, H, W)
 
-        # 6. 掩码转 Tensor，形状 (1, H, W)
+        # 8. 掩码转 Tensor，形状 (1, H, W)
         Ms_gt = torch.from_numpy(Ms_gt_np).unsqueeze(0).float()
         Mb_gt = torch.from_numpy(Mb_gt_np).unsqueeze(0).float()
 
-        # 7. 多尺度 GT（1/4, 1/2, 1/1），供 CoarseNet 多尺度监督用
+        # 9. 多尺度 GT（1/4, 1/2, 1/1），供 CoarseNet 多尺度监督用
         Igt_u = Igt.unsqueeze(0)
         Igt4 = F.interpolate(Igt_u, size=(self.img_size // 4, self.img_size // 4),
                              mode='bilinear', align_corners=False).squeeze(0)

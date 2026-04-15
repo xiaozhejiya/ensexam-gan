@@ -283,7 +283,7 @@ def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> dict
 
 # ── 主训练函数 ─────────────────────────────────────────────────────────────────
 
-def train_ensexam(cfg: dict, run_dir: str = None) -> float:
+def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float:
     train_cfg = cfg['train']
     data_cfg  = cfg['data']
     es_cfg    = cfg.get('early_stopping', {})
@@ -348,23 +348,23 @@ def train_ensexam(cfg: dict, run_dir: str = None) -> float:
         train_dataset = EnsExamRealDataset(
             data_root=data_root, img_size=img_size, is_train=True,
             overlap=overlap, mask_threshold=mask_threshold,
-            aug_cfg=data_cfg.get('augmentation'), file_list=train_files,
+            aug_cfg=data_cfg.get('augmentation'), file_list=train_files, phase=phase,
         )
         val_dataset = EnsExamRealDataset(
             data_root=data_root, img_size=img_size, is_train=True,
             overlap=0, mask_threshold=mask_threshold,
-            aug_cfg=None, file_list=val_files,
+            aug_cfg=None, file_list=val_files, phase='val',
         )
     else:
         # val_ratio=0：沿用旧行为，直接使用 test 目录
         train_dataset = EnsExamRealDataset(
             data_root=data_root, img_size=img_size, is_train=True,
             overlap=overlap, mask_threshold=mask_threshold,
-            aug_cfg=data_cfg.get('augmentation'),
+            aug_cfg=data_cfg.get('augmentation'), phase=phase,
         )
         val_dataset = EnsExamRealDataset(
             data_root=data_root, img_size=img_size, is_train=False,
-            overlap=0, mask_threshold=mask_threshold, aug_cfg=None,
+            overlap=0, mask_threshold=mask_threshold, aug_cfg=None, phase='val',
         )
 
     pin = device.type == 'cuda'
@@ -574,4 +574,4 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.yaml', help='config.yaml 路径')
     args = parser.parse_args()
-    train_ensexam(load_config(args.config))
+    train_ensexam(load_config(args.config), phase='train')

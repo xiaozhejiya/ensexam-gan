@@ -189,7 +189,7 @@ def run_tuning(cfg: dict, resume: bool = False):
               f"lambda_p={trial.params['lambda_p']:.3f}  "
               f"lambda_style={trial.params['lambda_style']:.1f}  "
               f"lambda_b={trial.params['lambda_b']:.3f}")
-        return train_ensexam(trial_cfg, run_dir=trial_dir)
+        return train_ensexam(trial_cfg, run_dir=trial_dir, phase='tune')
 
     # 创建或恢复 study
     storage    = _build_storage(tune_cfg['storage'])
