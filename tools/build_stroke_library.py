@@ -15,6 +15,7 @@ tools/build_stroke_library.py
     python tools/build_stroke_library.py 数学.pdf
     python tools/build_stroke_library.py 数学.pdf --out data/stroke_library --dpi 200
     python tools/build_stroke_library.py 语文.pdf --subject 语文 --dpi 300
+    python tools/build_stroke_library.py --input-root data/stroke_library --out data/stroke_library
 
 输出目录结构：
     data/stroke_library/
@@ -241,14 +242,92 @@ def build_library(pdf_path: str,
     return total
 
 
+def discover_pdfs_by_structure(input_root: str) -> list:
+    """按数据集结构发现 PDF，返回 [(pdf_path, subject_name), ...]。
+
+    支持两种常见输入：
+        1) 根目录：<root>/<subject>/*.pdf
+        2) 科目目录：<subject_dir>/*.pdf
+    """
+    root = Path(input_root)
+    if not root.exists():
+        raise FileNotFoundError(f"输入路径不存在: {root}")
+
+    tasks = []
+
+    # 结构 1：root/subject/*.pdf
+    subject_dirs = [p for p in sorted(root.iterdir()) if p.is_dir()]
+    for subject_dir in subject_dirs:
+        for pdf in sorted(subject_dir.glob('*.pdf')):
+            tasks.append((pdf, subject_dir.name))
+
+    # 结构 2：直接传入某个 subject 目录
+    if not tasks:
+        for pdf in sorted(root.glob('*.pdf')):
+            tasks.append((pdf, root.name))
+
+    return tasks
+
+
+def build_library_from_root(input_root: str,
+                            out_dir: str      = 'data/stroke_library',
+                            dpi: int          = 200,
+                            ink_threshold: int = 200,
+                            min_area: int     = 2000,
+                            max_area: int     = 500_000,
+                            pad: int          = 20,
+                            dilate_ksize: int = 80,
+                            tight_bbox: bool  = True,
+                            debug: bool       = False,
+                            split_by_pdf: bool = True) -> int:
+    """按给定目录批量提取 PDF。
+
+    默认 split_by_pdf=True 时，输出为：
+        <out_dir>/<subject>/<pdf_stem>/{all_images,box_label_txt,patches}
+    这样可避免同科目多个 PDF 输出重名覆盖。
+    """
+    tasks = discover_pdfs_by_structure(input_root)
+    if not tasks:
+        print(f"[build_stroke_library] 未在 {input_root} 下找到 PDF。")
+        return 0
+
+    print(f"[build_stroke_library] 批量模式：共发现 {len(tasks)} 个 PDF")
+    total = 0
+    for idx, (pdf_path, subject_name) in enumerate(tasks, start=1):
+        if split_by_pdf:
+            subject = str(Path(subject_name) / pdf_path.stem)
+        else:
+            subject = subject_name
+
+        print(f"\n[{idx}/{len(tasks)}] 开始处理：{pdf_path}")
+        total += build_library(
+            pdf_path      = str(pdf_path),
+            out_dir       = out_dir,
+            subject       = subject,
+            dpi           = dpi,
+            ink_threshold = ink_threshold,
+            min_area      = min_area,
+            max_area      = max_area,
+            pad           = pad,
+            dilate_ksize  = dilate_ksize,
+            tight_bbox    = tight_bbox,
+            debug         = debug,
+        )
+
+    print(f"\n[build_stroke_library] 批量完成，共保存 {total} 个 patch")
+    return total
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='从白底手写 PDF 提取笔迹 patch，构建笔迹库')
+        description='从白底手写 PDF 提取笔迹 patch，支持单 PDF 与按目录结构批量提取')
 
-    parser.add_argument('pdf',
-        help='手写 PDF 文件路径（白底）')
+    parser.add_argument('pdf', nargs='?', default=None,
+        help='手写 PDF 文件路径（白底）；与 --input-root 二选一')
+    parser.add_argument('--input-root', default=None,
+        help='按结构批量提取的输入路径：支持 <root>/<subject>/*.pdf 或 <subject_dir>/*.pdf')
     parser.add_argument('--out', default='data/stroke_library',
         help='输出根目录（默认 data/stroke_library）')
     parser.add_argument('--subject', default=None,
@@ -269,19 +348,41 @@ if __name__ == '__main__':
         help='禁用紧致 bbox，改用膨胀后连通域的宽松 bbox')
     parser.add_argument('--debug', action='store_true',
         help='保存每页的 bounding box 可视化图，用于调参')
+    parser.add_argument('--no-split-by-pdf', action='store_true',
+        help='批量模式下不按 PDF 名分子目录（可能导致同科目多 PDF 文件名冲突）')
 
     args = parser.parse_args()
 
-    build_library(
-        pdf_path      = args.pdf,
-        out_dir       = args.out,
-        subject       = args.subject,
-        dpi           = args.dpi,
-        ink_threshold = args.ink_threshold,
-        min_area      = args.min_area,
-        max_area      = args.max_area,
-        pad           = args.pad,
-        dilate_ksize  = args.dilate,
-        tight_bbox    = not args.no_tight_bbox,
-        debug         = args.debug,
-    )
+    if args.pdf and args.input_root:
+        parser.error('`pdf` 与 `--input-root` 只能二选一。')
+    if not args.pdf and not args.input_root:
+        parser.error('请提供 `pdf` 或 `--input-root`。')
+
+    if args.input_root:
+        build_library_from_root(
+            input_root    = args.input_root,
+            out_dir       = args.out,
+            dpi           = args.dpi,
+            ink_threshold = args.ink_threshold,
+            min_area      = args.min_area,
+            max_area      = args.max_area,
+            pad           = args.pad,
+            dilate_ksize  = args.dilate,
+            tight_bbox    = not args.no_tight_bbox,
+            debug         = args.debug,
+            split_by_pdf  = not args.no_split_by_pdf,
+        )
+    else:
+        build_library(
+            pdf_path      = args.pdf,
+            out_dir       = args.out,
+            subject       = args.subject,
+            dpi           = args.dpi,
+            ink_threshold = args.ink_threshold,
+            min_area      = args.min_area,
+            max_area      = args.max_area,
+            pad           = args.pad,
+            dilate_ksize  = args.dilate,
+            tight_bbox    = not args.no_tight_bbox,
+            debug         = args.debug,
+        )
