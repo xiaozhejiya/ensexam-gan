@@ -457,8 +457,19 @@ def insert_strokes_from_library(
         positions (可选) : list of (y, x, ph, pw)
     """
     # ── 1. 加载笔迹库文件列表 ──────────────────────────────────────────────────
+    # 兼容两种传参：
+    # 1) 直接传某个 patches 目录：.../subject/pdf_name/patches
+    # 2) 传 stroke_library 根目录：递归收集 **/patches/*.png（多科目/多 PDF）
     lib_path = Path(library_dir)
-    patch_files = sorted(lib_path.glob('*.png'))
+    if lib_path.name.lower() == 'patches':
+        patch_files = sorted(lib_path.glob('*.png'))
+    else:
+        patch_files = sorted(lib_path.glob('**/patches/*.png'))
+
+    # 回退兼容：若用户传的是旧结构 <subject>/patches 或其他仅含 patch png 的目录
+    if not patch_files and lib_path.is_dir():
+        patch_files = sorted(lib_path.glob('*.png'))
+
     if not patch_files:
         return (Iin.copy(), []) if return_positions else Iin.copy()
 
