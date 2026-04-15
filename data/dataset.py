@@ -13,6 +13,7 @@ from torchvision import transforms
 
 from data.mask_utils import generate_mask_from_pair, generate_mb_from_boxes
 from data.augmentation import get_train_augmentation
+from utils.path_utils import normalize_path
 from tools.color_augment import (
     create_class_mask,
     recolor_stroke,
@@ -61,6 +62,7 @@ class EnsExamRealDataset(Dataset):
                        用于从训练集中划分验证子集时传入不同的文件列表。
         """
         self.data_root = data_root
+        self.data_root = normalize_path(self.data_root)
         self.img_size = img_size
         self.is_train = is_train
         self.overlap = overlap
@@ -79,9 +81,9 @@ class EnsExamRealDataset(Dataset):
         ])
 
         split = "train" if is_train else "test"
-        self.img_dir  = os.path.join(data_root, split, "all_images")
-        self.gt_dir   = os.path.join(data_root, split, "all_labels")
-        self.box_dir  = os.path.join(data_root, split, "box_label_txt")
+        self.img_dir  = os.path.join(self.data_root, split, "all_images")
+        self.gt_dir   = os.path.join(self.data_root, split, "all_labels")
+        self.box_dir  = os.path.join(self.data_root, split, "box_label_txt")
         self.has_boxes = os.path.isdir(self.box_dir)
         self._file_list = file_list  # None 表示使用全部文件
 
