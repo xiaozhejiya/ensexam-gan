@@ -57,7 +57,7 @@ EXAM_PARAMS = dict(
 )
 
 # ── library 模式参数（从外部笔迹库加载） ────────────────────────────────────────
-LIBRARY_DIR    = r"data/stroke_library/数学/patches"  # patches 目录路径
+LIBRARY_DIR    = r"data/stroke_library/数学/数学7/patches"  # patches 目录路径
 LIBRARY_PARAMS = dict(
     n_insert       = 20,         # 最多插入多少个笔迹 patch
     scale_range    = (0.7, 1.3), # 缩放范围（相对于原 patch 尺寸）
