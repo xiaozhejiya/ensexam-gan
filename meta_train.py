@@ -20,7 +20,6 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
@@ -33,7 +32,7 @@ from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
 from networks.generator import Generator
 from tools.reptile import ReptileMetaLearner
-from train import setup_device, wrap_model, unwrap_model
+from train import setup_device, wrap_model, unwrap_model, set_seed
 
 
 def setup_logger(run_dir: str) -> logging.Logger:
@@ -91,14 +90,10 @@ def meta_train(cfg: dict):
     logger = setup_logger(run_dir)
 
     seed = train_cfg.get('seed', None)
+    reproducibility_mode = train_cfg.get('reproducibility_mode', 'statistical')
     if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        logger.info(f"随机种子已固定：{seed}")
+        set_seed(seed, mode=reproducibility_mode)
+        logger.info(f"随机种子已固定：{seed}（mode={reproducibility_mode}）")
 
     device, gpu_ids = setup_device(train_cfg)
     if len(gpu_ids) > 1:

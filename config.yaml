@@ -33,6 +33,7 @@ train:
   resume: true              # 是否从 resume_path 断点续训
   resume_path: reptile_checkpoints\reptile_meta_init.pth # 运行后手动更新为实际路径
   seed: 42                  # 全局随机种子，固定后训练可复现；设为 null 则不固定
+  reproducibility_mode: statistical  # strict=严格可复现(更慢)；statistical=统计可复现(更快，paper常用)
 
   # 学习率调度器
   scheduler:

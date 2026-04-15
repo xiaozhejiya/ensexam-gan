@@ -41,14 +41,19 @@ sys.path.insert(0, os.path.dirname(__file__))
 from tools.early_stopping import EarlyStopping
 
 
-def set_seed(seed: int):
-    """固定所有随机源，使训练结果可复现。"""
+def set_seed(seed: int, mode: str = 'statistical'):
+    """固定随机源；支持 strict（严格可复现）与 statistical（统计可复现，默认更快）。"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if mode == 'strict':
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        # 统计可复现：固定种子 + 允许 cudnn autotune，速度明显更快
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 def _worker_init_fn(worker_id: int):
@@ -318,9 +323,10 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     log_img_every = wb_cfg.get('log_image_every_n_epochs', 5)
 
     seed = train_cfg.get('seed', None)
+    reproducibility_mode = train_cfg.get('reproducibility_mode', 'statistical')
     if seed is not None:
-        set_seed(seed)
-        logger.info(f"随机种子已固定：{seed}")
+        set_seed(seed, mode=reproducibility_mode)
+        logger.info(f"随机种子已固定：{seed}（mode={reproducibility_mode}）")
 
     device, gpu_ids = setup_device(train_cfg)
     if len(gpu_ids) > 1:
