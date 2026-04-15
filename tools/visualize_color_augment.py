@@ -35,9 +35,10 @@ from tools.color_augment import (recolor_stroke,
                                   recolor_stroke_and_tint,
                                   create_class_mask,
                                   _random_vivid_color)
+from utils.path_utils import normalize_path
 
 # ── 数据集路径 ──────────────────────────────────────────────────────────────────
-DATA_ROOT = r"E:\dataset\SCUT-EnsExam"
+DATA_ROOT = normalize_path("~/dataset/SCUT-EnsExam")
 SPLIT     = "train"
 SEED      = 42
 

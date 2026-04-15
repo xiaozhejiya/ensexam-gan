@@ -35,6 +35,7 @@ from data.dataset import EnsExamRealDataset
 from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
 from networks.generator import Generator
+from utils.path_utils import normalize_path
 
 sys.path.insert(0, os.path.dirname(__file__))
 from tools.early_stopping import EarlyStopping
@@ -293,7 +294,7 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     lr          = train_cfg['lr']
     adam_betas  = tuple(train_cfg['adam_betas'])
     resume      = train_cfg['resume']
-    resume_path = train_cfg['resume_path']
+    resume_path = normalize_path(train_cfg['resume_path']) if train_cfg.get('resume_path') else ''
     num_workers = train_cfg['num_workers']
     save_every  = train_cfg['save_every_n_epochs']
 

@@ -38,9 +38,10 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tools.color_augment import create_class_mask
 from tools.stroke_insert import insert_strokes, insert_strokes_from_library
+from utils.path_utils import normalize_path
 
 # ── 数据集路径 ──────────────────────────────────────────────────────────────────
-DATA_ROOT   = r"E:\dataset\SCUT-EnsExam"
+DATA_ROOT   = normalize_path("~/dataset/SCUT-EnsExam")
 SPLIT       = "train"
 SEED        = 41
 
@@ -57,7 +58,7 @@ EXAM_PARAMS = dict(
 )
 
 # ── library 模式参数（从外部笔迹库加载） ────────────────────────────────────────
-LIBRARY_DIR    = r"data/stroke_library/数学/数学7/patches"  # patches 目录路径
+LIBRARY_DIR    = normalize_path("data/stroke_library")  # 支持根目录递归收集 **/patches/*.png
 LIBRARY_PARAMS = dict(
     n_insert       = 20,         # 最多插入多少个笔迹 patch
     scale_range    = (0.7, 1.3), # 缩放范围（相对于原 patch 尺寸）

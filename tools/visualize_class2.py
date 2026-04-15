@@ -24,7 +24,10 @@ for _fn in ['Microsoft YaHei', 'SimHei', 'STHeiti', 'WenQuanYi Micro Hei']:
         break
 matplotlib.rcParams['axes.unicode_minus'] = False
 
-DATA_ROOT = r"E:\dataset\SCUT-EnsExam"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.path_utils import normalize_path
+
+DATA_ROOT = normalize_path("~/dataset/SCUT-EnsExam")
 SPLIT     = "train"
 SEED      = 42
 

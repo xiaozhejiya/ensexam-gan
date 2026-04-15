@@ -35,6 +35,7 @@ except ImportError:
 
 from config_loader import load_config, save_config
 from train import train_ensexam
+from utils.path_utils import normalize_path
 
 # 屏蔽 Optuna 的 INFO 日志，避免刷屏
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -86,7 +87,7 @@ def build_trial_cfg(trial: optuna.Trial, base_cfg: dict, tune_cfg: dict) -> dict
     # 调优专用覆盖：缩短 epoch、从元初始化权重出发
     cfg['train']['epochs']      = tune_cfg['tune_epochs']
     cfg['train']['resume']      = True
-    cfg['train']['resume_path'] = tune_cfg['init_weights']
+    cfg['train']['resume_path'] = normalize_path(tune_cfg['init_weights'])
 
     # 关闭早停（5 epoch 太短，触发无意义）
     cfg['early_stopping']['enabled'] = False
@@ -144,7 +145,7 @@ def run_tuning(cfg: dict, resume: bool = False):
     wb_cfg   = cfg.get('wandb', {})
 
     # 检查元初始化权重存在
-    init_path = tune_cfg['init_weights']
+    init_path = normalize_path(tune_cfg['init_weights'])
     if not os.path.exists(init_path):
         raise FileNotFoundError(
             f"元初始化权重不存在：{init_path}\n"
