@@ -1,14 +1,21 @@
 """
 Reptile 元训练入口：学习对所有试卷笔迹风格都泛化的初始参数。
 
-用法:
+用法（单卡）:
     python meta_train.py                     # 使用默认 config.yaml
     python meta_train.py --config my.yaml
+
+用法（多卡 DDP）:
+    torchrun --nproc_per_node=2 meta_train.py
+    torchrun --nproc_per_node=2 meta_train.py --config my.yaml
+
+DDP 策略：每个 rank 独立采样不同 task 做 inner loop，
+Reptile outer update 时 all-reduce delta 取平均，等效于增大 n_tasks_per_episode。
 
 完成后在 config.yaml 中设置：
     resume: true
     resume_path: ./reptile_checkpoints/reptile_meta_init.pth
-再运行 python train.py 进行二次训练。
+再运行 python train.py（或 torchrun）进行二次训练。
 """
 import argparse
 import csv
@@ -32,7 +39,9 @@ from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
 from networks.generator import Generator
 from tools.reptile import ReptileMetaLearner
-from train import setup_device, wrap_model, unwrap_model, set_seed
+from train import (setup_device, unwrap_model, set_seed,
+                   setup_ddp, cleanup_ddp, is_ddp, is_main_process,
+                   get_rank, get_world_size)
 
 
 def setup_logger(run_dir: str) -> logging.Logger:
@@ -76,30 +85,42 @@ def build_task_loaders(dataset: EnsExamRealDataset,
 
 
 def meta_train(cfg: dict):
+    # DDP 初始化（torchrun 启动时生效，普通 python 启动时跳过）
+    setup_ddp()
+
     train_cfg   = cfg['train']
     data_cfg    = cfg['data']
     reptile_cfg = cfg['reptile']
 
-    # 创建本次运行目录
+    # 创建本次运行目录（仅 rank 0）
     base_dir  = reptile_cfg.get('save_dir', './checkpoints')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     run_dir   = os.path.join(base_dir, 'meta', timestamp)
-    os.makedirs(run_dir, exist_ok=True)
-    save_config(cfg, os.path.join(run_dir, 'config.yaml'))
+    if is_main_process():
+        os.makedirs(run_dir, exist_ok=True)
+        save_config(cfg, os.path.join(run_dir, 'config.yaml'))
+    # DDP：等 rank 0 建好目录
+    if is_ddp():
+        import torch.distributed as dist
+        dist.barrier()
 
-    logger = setup_logger(run_dir)
+    logger = setup_logger(run_dir) if is_main_process() else logging.getLogger('meta_train')
 
     seed = train_cfg.get('seed', None)
     reproducibility_mode = train_cfg.get('reproducibility_mode', 'statistical')
     if seed is not None:
-        set_seed(seed, mode=reproducibility_mode)
-        logger.info(f"随机种子已固定：{seed}（mode={reproducibility_mode}）")
+        # 每个 rank 用不同种子，确保采样到不同 task
+        rank_seed = seed + get_rank()
+        set_seed(rank_seed, mode=reproducibility_mode)
+        if is_main_process():
+            logger.info(f"随机种子已固定：{seed}（mode={reproducibility_mode}，各 rank 偏移）")
 
     device, gpu_ids = setup_device(train_cfg)
-    if len(gpu_ids) > 1:
-        logger.info(f"多卡训练：GPU {gpu_ids}，主设备 {device}")
-    else:
-        logger.info(f"使用设备：{device}")
+    if is_main_process():
+        if is_ddp():
+            logger.info(f"DDP 多卡元训练：world_size={get_world_size()}，主设备 {device}")
+        else:
+            logger.info(f"使用设备：{device}")
 
     # 数据集
     dataset = EnsExamRealDataset(
@@ -115,19 +136,19 @@ def meta_train(cfg: dict):
     task_loaders   = build_task_loaders(dataset, train_cfg['batch_size'],
                                         pin_memory=device.type == 'cuda')
     n_tasks_per_ep = reptile_cfg['n_tasks_per_episode']
-    logger.info(f"共 {len(task_loaders)} 个 task | 每 episode 采样 {n_tasks_per_ep} 个")
+    if is_main_process():
+        logger.info(f"共 {len(task_loaders)} 个 task | 每 episode 每 rank 采样 {n_tasks_per_ep} 个")
 
     if len(task_loaders) < n_tasks_per_ep:
         raise ValueError(
             f"可用 task 数 ({len(task_loaders)}) < n_tasks_per_episode ({n_tasks_per_ep})"
         )
 
-    # 模型（Reptile 的 inner loop 需要操作 state_dict，wrap 后传入 ReptileMetaLearner）
+    # 模型（Reptile 不用 DDP 包裹——inner loop 需要反复 deepcopy/restore state_dict，
+    # 与 DDP 的梯度同步机制冲突。改为在 outer update 后用 broadcast 同步参数。）
     G         = Generator(cfg=cfg['model']).to(device)
     D         = Discriminator().to(device)
     criterion = EnsExamLoss(cfg=cfg['loss']).to(device)
-    G         = wrap_model(G, gpu_ids)
-    D         = wrap_model(D, gpu_ids)
 
     meta_learner = ReptileMetaLearner(G, D, criterion, device, cfg)
 
@@ -137,7 +158,7 @@ def meta_train(cfg: dict):
 
     # CSV 日志
     csv_path = os.path.join(run_dir, 'meta_loss_history.csv')
-    if not os.path.exists(csv_path):
+    if is_main_process() and not os.path.exists(csv_path):
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow(['episode', 'loss_G', 'loss_D'])
 
@@ -146,52 +167,61 @@ def meta_train(cfg: dict):
     t_start  = time.time()
 
     # 元训练循环
-    for episode in tqdm(range(meta_epochs), desc='Meta-train', ncols=100):
+    for episode in tqdm(range(meta_epochs), desc='Meta-train', ncols=100,
+                        disable=not is_main_process()):
         sampled = random.sample(task_loaders, n_tasks_per_ep)
         stats   = meta_learner.run_episode(sampled)
+
+        # DDP：各 rank 独立跑了不同 task，现在同步参数（broadcast from rank 0）
+        if is_ddp():
+            meta_learner.broadcast_params()
 
         window_G += stats['loss_G']
         window_D += stats['loss_D']
 
-        with open(csv_path, 'a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow(
-                [episode + 1, f"{stats['loss_G']:.6f}", f"{stats['loss_D']:.6f}"])
+        if is_main_process():
+            with open(csv_path, 'a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(
+                    [episode + 1, f"{stats['loss_G']:.6f}", f"{stats['loss_D']:.6f}"])
 
-        if (episode + 1) % log_every == 0:
-            avg_G    = window_G / log_every
-            avg_D    = window_D / log_every
-            elapsed  = time.time() - t_start
-            eta_sec  = elapsed / (episode + 1) * (meta_epochs - episode - 1)
-            eta_str  = time.strftime('%H:%M:%S', time.gmtime(eta_sec))
-            logger.info(
-                f"Episode {episode + 1:>4}/{meta_epochs} | "
-                f"G={avg_G:.4f}  D={avg_D:.4f} | "
-                f"elapsed={time.strftime('%H:%M:%S', time.gmtime(elapsed))}  ETA={eta_str}"
-            )
-            window_G = window_D = 0.0
+            if (episode + 1) % log_every == 0:
+                avg_G    = window_G / log_every
+                avg_D    = window_D / log_every
+                elapsed  = time.time() - t_start
+                eta_sec  = elapsed / (episode + 1) * (meta_epochs - episode - 1)
+                eta_str  = time.strftime('%H:%M:%S', time.gmtime(eta_sec))
+                logger.info(
+                    f"Episode {episode + 1:>4}/{meta_epochs} | "
+                    f"G={avg_G:.4f}  D={avg_D:.4f} | "
+                    f"elapsed={time.strftime('%H:%M:%S', time.gmtime(elapsed))}  ETA={eta_str}"
+                )
+                window_G = window_D = 0.0
 
-        if (episode + 1) % save_every == 0 or episode == meta_epochs - 1:
-            path = os.path.join(run_dir, f'reptile_epoch_{episode + 1}.pth')
-            torch.save({'G_state_dict': G.state_dict(),
-                        'D_state_dict': D.state_dict()}, path)
-            logger.info(f"  checkpoint → {path}")
+            if (episode + 1) % save_every == 0 or episode == meta_epochs - 1:
+                path = os.path.join(run_dir, f'reptile_epoch_{episode + 1}.pth')
+                torch.save({'G_state_dict': G.state_dict(),
+                            'D_state_dict': D.state_dict()}, path)
+                logger.info(f"  checkpoint → {path}")
 
     # 保存供 train.py resume 使用的最终检查点
-    final_path = os.path.join(run_dir, 'reptile_meta_init.pth')
-    torch.save({
-        'epoch':        0,
-        'G_state_dict': G.state_dict(),
-        'D_state_dict': D.state_dict(),
-        'optimizer_G':  {},
-        'optimizer_D':  {},
-        'avg_loss_G':   0.0,
-        'avg_loss_D':   0.0,
-        'val_loss':     0.0,
-    }, final_path)
+    if is_main_process():
+        final_path = os.path.join(run_dir, 'reptile_meta_init.pth')
+        torch.save({
+            'epoch':        0,
+            'G_state_dict': G.state_dict(),
+            'D_state_dict': D.state_dict(),
+            'optimizer_G':  {},
+            'optimizer_D':  {},
+            'avg_loss_G':   0.0,
+            'avg_loss_D':   0.0,
+            'val_loss':     0.0,
+        }, final_path)
 
-    logger.info(f"\n元训练完成！初始化参数 → {final_path}")
-    logger.info('下一步：config.yaml 中设置 "resume": true, "resume_path": "%s"' % final_path)
-    logger.info("然后运行 python train.py 开始二次训练。")
+        logger.info(f"\n元训练完成！初始化参数 → {final_path}")
+        logger.info('下一步：config.yaml 中设置 "resume": true, "resume_path": "%s"' % final_path)
+        logger.info("然后运行 python train.py 开始二次训练。")
+
+    cleanup_ddp()
 
 
 if __name__ == '__main__':
