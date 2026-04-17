@@ -134,8 +134,10 @@ def wrap_model(model: nn.Module, gpu_ids: list) -> nn.Module:
     """DDP 模式用 DistributedDataParallel，否则单卡直接返回。"""
     if is_ddp():
         local_rank = int(os.environ['LOCAL_RANK'])
+        # static_graph=True：GAN 交替训练每次 forward/backward 图形状固定，
+        # 缓存一次即可，避免 find_unused_parameters 每次遍历的开销。
         return DDP(model, device_ids=[local_rank], output_device=local_rank,
-                   find_unused_parameters=True)
+                   find_unused_parameters=True, static_graph=True)
     return model
 
 
@@ -354,6 +356,9 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     resume      = train_cfg['resume']
     resume_path = normalize_path(train_cfg['resume_path']) if train_cfg.get('resume_path') else ''
     num_workers = train_cfg['num_workers']
+    # Linux 服务器上 num_workers=0 会成为数据加载瓶颈，自动提升
+    if num_workers == 0 and os.name != 'nt':
+        num_workers = min(4, os.cpu_count() or 1)
     save_every  = train_cfg['save_every_n_epochs']
 
     data_root      = data_cfg['data_root']
@@ -458,10 +463,9 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     D = Discriminator().to(device)
     criterion = EnsExamLoss(cfg=cfg['loss']).to(device)
 
-    # 将 BatchNorm 转为 SyncBatchNorm（DDP 模式下跨卡同步 BN 统计量）
-    if is_ddp():
-        G = nn.SyncBatchNorm.convert_sync_batchnorm(G)
-        D = nn.SyncBatchNorm.convert_sync_batchnorm(D)
+    # 注意：不使用 SyncBatchNorm。
+    # batch_size=8/GPU 足够 BN 统计，而 SyncBN 在每个 BN 层都做 allreduce，
+    # 对本模型（20+ BN 层）开销远大于收益，实测比单卡还慢。
 
     # optimizer 在 wrap 前创建，持有原始参数引用
     optimizer_G = optim.Adam(G.parameters(), lr=lr, betas=adam_betas)
