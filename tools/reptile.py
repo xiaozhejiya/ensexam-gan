@@ -9,14 +9,19 @@ Reptile 元学习器，纯 PyTorch 实现，不依赖 learn2learn。
     θ_meta += ε · mean(θ_i − θ_meta)   # Reptile outer update
 
 用 state_dict 深拷贝代替 clone_module，避免计算图残留导致的非叶节点问题。
+
+DDP 兼容：
+  - inner loop 不使用 DDP 包裹（需要反复 save/restore state_dict）
+  - outer update 后通过 broadcast 同步各 rank 的参数
 """
 import copy
 
 import torch
+import torch.distributed as dist
 from torch import optim
 
 from losses.losses import EnsExamLoss
-from train import unwrap_model
+from train import unwrap_model, is_ddp
 
 
 class ReptileMetaLearner:
@@ -78,6 +83,7 @@ class ReptileMetaLearner:
             loss_D = (EnsExamLoss.hinge_loss_D(real_g, fake_g)
                       + EnsExamLoss.hinge_loss_D(real_l, fake_l)) / 2
             loss_D.backward()
+            torch.nn.utils.clip_grad_norm_(self.D.parameters(), max_norm=1.0)
             opt_D.step()
 
             # 训练 G
@@ -85,6 +91,7 @@ class ReptileMetaLearner:
             fake_g, fake_l = self.D(Icomp, Mb_gt)
             loss_G, _      = self.criterion(gen_out, gt, (fake_g, fake_l))
             loss_G.backward()
+            torch.nn.utils.clip_grad_norm_(self.G.parameters(), max_norm=1.0)
             opt_G.step()
 
         # 3. 记录 inner 训练后的参数
@@ -130,3 +137,18 @@ class ReptileMetaLearner:
 
         n = len(task_loaders)
         return {'loss_G': sum_G / n, 'loss_D': sum_D / n}
+
+    def broadcast_params(self, src: int = 0):
+        """DDP 模式下，将 rank src 的参数广播到所有 rank，保持模型一致。
+
+        Reptile 不使用 DDP 包裹模型，因此每个 rank 独立执行 inner loop
+        和 outer update（采样不同 task）。广播后所有 rank 从同一起点继续。
+        """
+        if not is_ddp():
+            return
+        for model in (self.G, self.D):
+            for param in model.parameters():
+                dist.broadcast(param.data, src=src)
+            # 同步 BatchNorm 的 running_mean / running_var
+            for buf in model.buffers():
+                dist.broadcast(buf.data, src=src)
