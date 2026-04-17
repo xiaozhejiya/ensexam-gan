@@ -1,9 +1,13 @@
 """
 训练入口：从 config.yaml 加载所有超参数，组装数据集、模型、损失函数并启动训练。
 
-用法:
+用法（单卡）:
     python train.py                        # 使用默认 config.yaml
     python train.py --config my_cfg.yaml   # 使用自定义配置
+
+用法（多卡 DDP）:
+    torchrun --nproc_per_node=2 train.py
+    torchrun --nproc_per_node=2 train.py --config my_cfg.yaml
 """
 import argparse
 import csv
@@ -18,10 +22,13 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 from pytorch_msssim import ms_ssim as compute_ms_ssim
 from torch import optim
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 try:
@@ -66,10 +73,17 @@ def _worker_init_fn(worker_id: int):
 def setup_device(train_cfg: dict):
     """
     解析 gpu_ids 配置，返回 (primary_device, gpu_ids_list)。
-    gpu_ids_list 长度 > 1 时启用 DataParallel；长度 == 1 时单卡；空列表表示 CPU。
+    在 DDP 模式下（torchrun 启动），LOCAL_RANK 环境变量会覆盖 gpu_ids。
     """
     if not torch.cuda.is_available():
         return torch.device('cpu'), []
+
+    # DDP 模式：torchrun 会设置 LOCAL_RANK
+    local_rank = os.environ.get('LOCAL_RANK')
+    if local_rank is not None:
+        idx = int(local_rank)
+        torch.cuda.set_device(idx)
+        return torch.device(f'cuda:{idx}'), [idx]
 
     gpu_ids = train_cfg.get('gpu_ids', None)
     if gpu_ids:
@@ -84,16 +98,52 @@ def setup_device(train_cfg: dict):
     return torch.device(device_str), [idx]
 
 
+def is_ddp() -> bool:
+    """判断当前是否处于 DDP 模式（由 torchrun 启动）。"""
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    """返回当前进程的全局 rank，非 DDP 时返回 0。"""
+    return dist.get_rank() if is_ddp() else 0
+
+
+def get_world_size() -> int:
+    """返回总进程数，非 DDP 时返回 1。"""
+    return dist.get_world_size() if is_ddp() else 1
+
+
+def is_main_process() -> bool:
+    """只有 rank 0 做日志/保存/W&B。"""
+    return get_rank() == 0
+
+
+def setup_ddp():
+    """初始化 DDP 进程组（仅在 torchrun 环境下调用）。"""
+    if os.environ.get('LOCAL_RANK') is not None and not dist.is_initialized():
+        dist.init_process_group(backend='nccl')
+
+
+def cleanup_ddp():
+    """销毁 DDP 进程组。"""
+    if is_ddp():
+        dist.destroy_process_group()
+
+
 def wrap_model(model: nn.Module, gpu_ids: list) -> nn.Module:
-    """多 GPU 时用 DataParallel 包裹模型，单 GPU/CPU 直接返回。"""
-    if len(gpu_ids) > 1:
-        return nn.DataParallel(model, device_ids=gpu_ids)
+    """DDP 模式用 DistributedDataParallel，否则单卡直接返回。"""
+    if is_ddp():
+        local_rank = int(os.environ['LOCAL_RANK'])
+        return DDP(model, device_ids=[local_rank], output_device=local_rank,
+                   find_unused_parameters=True)
     return model
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
-    """取出 DataParallel 内层模型，用于 state_dict 的保存与加载。"""
-    return model.module if isinstance(model, nn.DataParallel) else model
+    """取出 DDP / DataParallel 内层模型，用于 state_dict 的保存与加载。"""
+    if isinstance(model, (DDP, nn.DataParallel)):
+        return model.module
+    return model
 
 
 class CUDAPrefetcher:
@@ -290,6 +340,9 @@ def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> dict
 # ── 主训练函数 ─────────────────────────────────────────────────────────────────
 
 def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float:
+    # DDP 初始化（torchrun 启动时生效，普通 python 启动时跳过）
+    setup_ddp()
+
     train_cfg = cfg['train']
     data_cfg  = cfg['data']
     es_cfg    = cfg.get('early_stopping', {})
@@ -316,9 +369,9 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     os.makedirs(run_dir, exist_ok=True)
     save_config(cfg, os.path.join(run_dir, 'config.yaml'))
 
-    logger  = setup_logger(run_dir)
-    csv_log = CSVLogger(run_dir)
-    wb_run  = init_wandb(cfg)
+    logger  = setup_logger(run_dir) if is_main_process() else logging.getLogger('train')
+    csv_log = CSVLogger(run_dir) if is_main_process() else None
+    wb_run  = init_wandb(cfg) if is_main_process() else None
     wb_cfg  = cfg.get('wandb', {})
     log_img_every = wb_cfg.get('log_image_every_n_epochs', 5)
 
@@ -329,10 +382,11 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         logger.info(f"随机种子已固定：{seed}（mode={reproducibility_mode}）")
 
     device, gpu_ids = setup_device(train_cfg)
-    if len(gpu_ids) > 1:
-        logger.info(f"多卡训练：GPU {gpu_ids}，主设备 {device}")
-    else:
-        logger.info(f"使用设备：{device}")
+    if is_main_process():
+        if is_ddp():
+            logger.info(f"DDP 多卡训练：world_size={get_world_size()}，主设备 {device}")
+        else:
+            logger.info(f"使用设备：{device}")
 
     # 数据集
     val_ratio = data_cfg.get('val_ratio', 0.0)
@@ -378,21 +432,38 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     g = torch.Generator()
     if seed is not None:
         g.manual_seed(seed)
+
+    # DDP 模式下使用 DistributedSampler 分片数据
+    train_sampler = None
+    val_sampler   = None
+    if is_ddp():
+        train_sampler = DistributedSampler(train_dataset, shuffle=True, seed=seed or 0)
+        val_sampler   = DistributedSampler(val_dataset, shuffle=False)
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, num_workers=num_workers,
+                              shuffle=(train_sampler is None),
+                              sampler=train_sampler,
+                              num_workers=num_workers,
                               drop_last=True, pin_memory=pin,
                               worker_init_fn=_worker_init_fn, generator=g)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size,
-                              shuffle=False, num_workers=num_workers,
+                              shuffle=False, sampler=val_sampler,
+                              num_workers=num_workers,
                               drop_last=False, pin_memory=pin)
-    logger.info(f"训练集：{len(train_dataset)} patches | 验证集：{len(val_dataset)} patches")
+    if is_main_process():
+        logger.info(f"训练集：{len(train_dataset)} patches | 验证集：{len(val_dataset)} patches")
 
     # 模型
     G = Generator(cfg=cfg['model']).to(device)
     D = Discriminator().to(device)
     criterion = EnsExamLoss(cfg=cfg['loss']).to(device)
 
-    # optimizer 在 wrap 前创建，持有原始参数引用，DataParallel 不影响参数地址
+    # 将 BatchNorm 转为 SyncBatchNorm（DDP 模式下跨卡同步 BN 统计量）
+    if is_ddp():
+        G = nn.SyncBatchNorm.convert_sync_batchnorm(G)
+        D = nn.SyncBatchNorm.convert_sync_batchnorm(D)
+
+    # optimizer 在 wrap 前创建，持有原始参数引用
     optimizer_G = optim.Adam(G.parameters(), lr=lr, betas=adam_betas)
     optimizer_D = optim.Adam(D.parameters(), lr=lr, betas=adam_betas)
 
@@ -423,7 +494,7 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         )
         logger.info(f"早停已启用：patience={es.patience}, min_delta={es.min_delta}")
 
-    # 断点续训（在 DataParallel wrap 之前加载，避免 module. 前缀问题）
+    # 断点续训（在 DDP wrap 之前加载，避免 module. 前缀问题）
     start_epoch = 0
     if resume and os.path.exists(resume_path):
         ckpt = torch.load(resume_path, map_location=device)
@@ -438,9 +509,10 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         if ckpt.get('scheduler_D') and scheduler_D is not None:
             scheduler_D.load_state_dict(ckpt['scheduler_D'])
         start_epoch = ckpt['epoch']
-        logger.info(f"断点续训：从第 {start_epoch} epoch 恢复")
+        if is_main_process():
+            logger.info(f"断点续训：从第 {start_epoch} epoch 恢复")
 
-    # DataParallel wrap（checkpoint 加载完成后再 wrap）
+    # DDP wrap（checkpoint 加载完成后再 wrap）
     G = wrap_model(G, gpu_ids)
     D = wrap_model(D, gpu_ids)
 
@@ -449,10 +521,15 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     best_val_loss = float('inf')
     G.train(); D.train()
     for epoch in range(start_epoch, epochs):
+        # DDP：每个 epoch 更新 sampler 的随机种子，保证数据打散
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         epoch_loss_G = epoch_loss_D = 0.0
         epoch_parts  = [0.0] * 6   # [adv, lr, per, style, sn, block]
         pbar = tqdm(train_prefetcher, total=len(train_loader),
-                    desc=f"Epoch {epoch + 1}/{epochs}", ncols=100)
+                    desc=f"Epoch {epoch + 1}/{epochs}", ncols=100,
+                    disable=not is_main_process())
 
         for Iin, Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt in pbar:
             gt   = (Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt)
@@ -498,81 +575,95 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         best_val_loss = min(best_val_loss, val_m['l1'])
 
         current_lr = optimizer_G.param_groups[0]['lr']
-        logger.info(
-            f"Epoch {epoch + 1:>4} | "
-            f"Train G={avg_G:.4f}  D={avg_D:.4f} | "
-            f"adv={avg_parts[0]:.4f}  rec={avg_parts[1]:.4f}  "
-            f"per={avg_parts[2]:.4f}  style={avg_parts[3]:.4f} | "
-            f"PSNR={val_m['psnr']:.2f}  MS-SSIM={val_m['ms_ssim']:.4f}  "
-            f"MSE={val_m['mse']:.6f}  AGE={val_m['age']:.2f}  "
-            f"pEPs={val_m['peps']:.4f}  pCEPs={val_m['pceps']:.4f} | "
-            f"LR={current_lr:.2e}"
-        )
-        csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_m['l1'])
 
-        # W&B：上报数值指标
-        if wb_run is not None:
-            wandb.log({
-                'train/loss_G':     avg_G,
-                'train/loss_D':     avg_D,
-                'train/adv':        avg_parts[0],
-                'train/lr_loss':    avg_parts[1],
-                'train/perceptual': avg_parts[2],
-                'train/style':      avg_parts[3],
-                'train/sn':         avg_parts[4],
-                'train/block':      avg_parts[5],
-                'val/psnr':         val_m['psnr'],
-                'val/ms_ssim':      val_m['ms_ssim'],
-                'val/mse':          val_m['mse'],
-                'val/l1':           val_m['l1'],
-                'val/age':          val_m['age'],
-                'val/peps':         val_m['peps'],
-                'val/pceps':        val_m['pceps'],
-                'train/lr':         current_lr,
-            }, step=epoch + 1)
-            # 每隔 N epoch 上传对比图
-            if (epoch + 1) % log_img_every == 0:
-                log_images_to_wandb(G, val_loader, device, epoch + 1)
+        # 只在 rank 0 上做日志 / CSV / W&B / checkpoint
+        if is_main_process():
+            logger.info(
+                f"Epoch {epoch + 1:>4} | "
+                f"Train G={avg_G:.4f}  D={avg_D:.4f} | "
+                f"adv={avg_parts[0]:.4f}  rec={avg_parts[1]:.4f}  "
+                f"per={avg_parts[2]:.4f}  style={avg_parts[3]:.4f} | "
+                f"PSNR={val_m['psnr']:.2f}  MS-SSIM={val_m['ms_ssim']:.4f}  "
+                f"MSE={val_m['mse']:.6f}  AGE={val_m['age']:.2f}  "
+                f"pEPs={val_m['peps']:.4f}  pCEPs={val_m['pceps']:.4f} | "
+                f"LR={current_lr:.2e}"
+            )
+            csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_m['l1'])
 
-        # 保存 checkpoint（先存再 step，确保 lr 与本 epoch 对应）
-        ckpt = {
-            'epoch': epoch + 1,
-            'G_state_dict': unwrap_model(G).state_dict(),
-            'D_state_dict': unwrap_model(D).state_dict(),
-            'optimizer_G':  optimizer_G.state_dict(),
-            'optimizer_D':  optimizer_D.state_dict(),
-            'scheduler_G':  scheduler_G.state_dict() if scheduler_G else None,
-            'scheduler_D':  scheduler_D.state_dict() if scheduler_D else None,
-            'avg_loss_G':   avg_G,
-            'avg_loss_D':   avg_D,
-            'val_loss':     val_loss,
-        }
-        torch.save(ckpt, os.path.join(run_dir, 'latest.pth'))
+            # W&B：上报数值指标
+            if wb_run is not None:
+                wandb.log({
+                    'train/loss_G':     avg_G,
+                    'train/loss_D':     avg_D,
+                    'train/adv':        avg_parts[0],
+                    'train/lr_loss':    avg_parts[1],
+                    'train/perceptual': avg_parts[2],
+                    'train/style':      avg_parts[3],
+                    'train/sn':         avg_parts[4],
+                    'train/block':      avg_parts[5],
+                    'val/psnr':         val_m['psnr'],
+                    'val/ms_ssim':      val_m['ms_ssim'],
+                    'val/mse':          val_m['mse'],
+                    'val/l1':           val_m['l1'],
+                    'val/age':          val_m['age'],
+                    'val/peps':         val_m['peps'],
+                    'val/pceps':        val_m['pceps'],
+                    'train/lr':         current_lr,
+                }, step=epoch + 1)
+                # 每隔 N epoch 上传对比图
+                if (epoch + 1) % log_img_every == 0:
+                    log_images_to_wandb(G, val_loader, device, epoch + 1)
+
+            # 保存 checkpoint（先存再 step，确保 lr 与本 epoch 对应）
+            ckpt = {
+                'epoch': epoch + 1,
+                'G_state_dict': unwrap_model(G).state_dict(),
+                'D_state_dict': unwrap_model(D).state_dict(),
+                'optimizer_G':  optimizer_G.state_dict(),
+                'optimizer_D':  optimizer_D.state_dict(),
+                'scheduler_G':  scheduler_G.state_dict() if scheduler_G else None,
+                'scheduler_D':  scheduler_D.state_dict() if scheduler_D else None,
+                'avg_loss_G':   avg_G,
+                'avg_loss_D':   avg_D,
+                'val_loss':     val_m['l1'],
+            }
+            torch.save(ckpt, os.path.join(run_dir, 'latest.pth'))
+
         if scheduler_G is not None:
             scheduler_G.step()
             scheduler_D.step()
-        if (epoch + 1) % save_every == 0 or epoch == epochs - 1:
-            path = os.path.join(run_dir, f'epoch_{epoch + 1}.pth')
-            torch.save(ckpt, path)
-            logger.info(f"已保存：{path}")
 
-        # 保存最优模型（由早停判定，监控 PSNR）
+        if is_main_process():
+            if (epoch + 1) % save_every == 0 or epoch == epochs - 1:
+                path = os.path.join(run_dir, f'epoch_{epoch + 1}.pth')
+                torch.save(ckpt, path)
+                logger.info(f"已保存：{path}")
+
+        # 保存最优模型（由早停判定，监控 PSNR）——所有 rank 都 step 以保持同步
         if es is not None:
-            if es.step(val_m['psnr'], epoch + 1):
-                logger.info(
-                    f"早停触发：连续 {es.patience} epoch 无改善，"
-                    f"最优 epoch={es.best_epoch}，PSNR={es.best_value:.2f}"
-                )
+            should_stop = es.step(val_m['psnr'], epoch + 1)
+            if is_main_process():
+                if should_stop:
+                    logger.info(
+                        f"早停触发：连续 {es.patience} epoch 无改善，"
+                        f"最优 epoch={es.best_epoch}，PSNR={es.best_value:.2f}"
+                    )
+                if es.is_best:
+                    torch.save(ckpt, os.path.join(run_dir, 'best.pth'))
+                    logger.info(f"已更新最优模型 best.pth（PSNR={val_m['psnr']:.2f}）")
+                    if wb_run is not None:
+                        wandb.run.summary['best_psnr']  = val_m['psnr']
+                        wandb.run.summary['best_epoch'] = epoch + 1
+            if should_stop:
                 break
-            if es.is_best:
-                torch.save(ckpt, os.path.join(run_dir, 'best.pth'))
-                logger.info(f"已更新最优模型 best.pth（PSNR={val_m['psnr']:.2f}）")
-                if wb_run is not None:
-                    wandb.run.summary['best_psnr']  = val_m['psnr']
-                    wandb.run.summary['best_epoch'] = epoch + 1
+
+        # DDP barrier：确保所有 rank 同步到这里再进入下一个 epoch
+        if is_ddp():
+            dist.barrier()
 
     if wb_run is not None:
         wandb.finish()
+    cleanup_ddp()
 
     return es.best_value if es is not None else best_val_loss
 
