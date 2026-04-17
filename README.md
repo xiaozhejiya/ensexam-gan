@@ -1,6 +1,7 @@
 # EnsExam — 试卷文字擦除模型
 
-基于 GAN 的试卷手写笔迹擦除模型，结合 Reptile 元学习实现跨学生笔迹风格的快速泛化。
+基于 GAN 的试卷手写笔迹擦除模型，结合 Reptile 元学习实现跨学生笔迹风格的快速泛化。  
+支持单卡和多卡 **DistributedDataParallel (DDP)** 训练。
 
 ---
 
@@ -153,9 +154,17 @@ python tools/test_gpu.py
 在所有学生笔迹风格上学习泛化初始参数，约需数小时。
 
 ```bash
+# 单卡
 python meta_train.py
-# 输出：reptile_checkpoints/reptile_meta_init.pth
+
+# 多卡 DDP（例如 2 卡）
+torchrun --nproc_per_node=2 meta_train.py
+
+# 输出：checkpoints/meta/YYYYMMDD_HHMMSS/reptile_meta_init.pth
 ```
+
+> **DDP 加速原理**：每个 GPU 独立采样不同的 task（笔迹风格）执行 inner loop，
+> Reptile outer update 后通过 `broadcast` 同步参数，等效于 `n_tasks_per_episode × N_GPU` 的 episode 规模，显著提升元训练速度。
 
 ### 第 2 步：超参数调优（可选）
 
@@ -182,15 +191,22 @@ python tune.py --resume
 ```yaml
 train:
   resume: true
-  resume_path: ./reptile_checkpoints/reptile_meta_init.pth
+  resume_path: ./checkpoints/meta/YYYYMMDD_HHMMSS/reptile_meta_init.pth
 ```
 
 ```bash
+# 单卡
 python train.py
+
+# 多卡 DDP（例如 2 卡）
+torchrun --nproc_per_node=2 train.py
 
 # 指定配置文件
 python train.py --config my_config.yaml
 ```
+
+> **多卡说明**：DDP 模式由 `torchrun` 自动管理进程，`config.yaml` 中的 `gpu_ids`
+> 字段在 DDP 模式下会被 `LOCAL_RANK` 环境变量覆盖，**无需手动修改**。
 
 **训练产物：**
 
