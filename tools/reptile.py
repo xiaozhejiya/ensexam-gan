@@ -151,5 +151,9 @@ class ReptileMetaLearner:
                 dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
                 param.data.div_(world_size)
             for buf in model.buffers():
-                dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
-                buf.data.div_(world_size)
+                if buf.is_floating_point():
+                    dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
+                    buf.data.div_(world_size)
+                else:
+                    # num_batches_tracked 等整型 buffer，直接广播 rank 0 的值
+                    dist.broadcast(buf.data, src=0)
