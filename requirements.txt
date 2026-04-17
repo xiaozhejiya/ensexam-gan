@@ -15,6 +15,7 @@ PyMuPDF                # PDF 渲染，用于笔迹库构建（build_stroke_libra
 
 # ── 训练工具 ─────────────────────────────────────────────────────────────────
 tqdm==4.45.0
+importlib_metadata         # torchrun (torch.distributed.elastic) 
 
 # ── 超参数调优 ───────────────────────────────────────────────────────────────
 optuna==4.0.0
