@@ -134,10 +134,14 @@ def wrap_model(model: nn.Module, gpu_ids: list) -> nn.Module:
     """DDP 模式用 DistributedDataParallel，否则单卡直接返回。"""
     if is_ddp():
         local_rank = int(os.environ['LOCAL_RANK'])
-        # static_graph=True：GAN 交替训练每次 forward/backward 图形状固定，
-        # 缓存一次即可，避免 find_unused_parameters 每次遍历的开销。
+        # find_unused_parameters=False：训练循环已重构，D step 中 G 绕过 DDP，
+        #   G step 中 D 用 no_sync()，不再有真正 unused 的参数。
+        # gradient_as_bucket_view=True：梯度直接引用 bucket 内存，省一次拷贝。
+        # broadcast_buffers=False：不使用 SyncBN，BN running stats 无需跨 rank 同步。
         return DDP(model, device_ids=[local_rank], output_device=local_rank,
-                   find_unused_parameters=True, static_graph=True)
+                   find_unused_parameters=False,
+                   gradient_as_bucket_view=True,
+                   broadcast_buffers=False)
     return model
 
 
@@ -450,11 +454,15 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
                               sampler=train_sampler,
                               num_workers=num_workers,
                               drop_last=True, pin_memory=pin,
+                              persistent_workers=(num_workers > 0),
+                              prefetch_factor=(2 if num_workers > 0 else None),
                               worker_init_fn=_worker_init_fn, generator=g)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size,
                               shuffle=False, sampler=val_sampler,
                               num_workers=num_workers,
-                              drop_last=False, pin_memory=pin)
+                              drop_last=False, pin_memory=pin,
+                              persistent_workers=(num_workers > 0),
+                              prefetch_factor=(2 if num_workers > 0 else None))
     if is_main_process():
         logger.info(f"训练集：{len(train_dataset)} patches | 验证集：{len(val_dataset)} patches")
 
@@ -517,20 +525,36 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
             logger.info(f"断点续训：从第 {start_epoch} epoch 恢复")
 
     # DDP wrap（checkpoint 加载完成后再 wrap）
+    # 只有 G 用 DDP 包裹——GAN 交替训练中，D step 只需 D backward，
+    # G step 只需 G gradient sync。若两者都 DDP wrap，必须处理 unused params。
+    # D 的梯度同步改为手动 all-reduce，彻底避免 find_unused_parameters 的问题。
     G = wrap_model(G, gpu_ids)
-    D = wrap_model(D, gpu_ids)
+    # D 不包裹 DDP
 
     # 训练循环
     train_prefetcher = CUDAPrefetcher(train_loader, device)
     best_val_loss = float('inf')
     G.train(); D.train()
+
+    # AMP：A800 等 Ampere+ GPU 使用 bf16 混合精度大幅提升吞吐
+    use_amp = device.type == 'cuda' and torch.cuda.is_bf16_supported()
+    amp_dtype = torch.bfloat16 if use_amp else torch.float16
+    scaler_G = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    scaler_D = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+    if is_main_process() and use_amp:
+        logger.info(f"AMP 已启用：dtype={amp_dtype}")
+
     for epoch in range(start_epoch, epochs):
         # DDP：每个 epoch 更新 sampler 的随机种子，保证数据打散
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        epoch_loss_G = epoch_loss_D = 0.0
-        epoch_parts  = [0.0] * 6   # [adv, lr, per, style, sn, block]
+        # GPU 上累加损失，避免每 step .item() 导致的 CPU-GPU 同步
+        sum_loss_G = torch.zeros(1, device=device)
+        sum_loss_D = torch.zeros(1, device=device)
+        sum_parts  = torch.zeros(6, device=device)
+        n_steps = 0
+
         pbar = tqdm(train_prefetcher, total=len(train_loader),
                     desc=f"Epoch {epoch + 1}/{epochs}", ncols=100,
                     disable=not is_main_process())
@@ -538,41 +562,57 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         for Iin, Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt in pbar:
             gt   = (Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt)
 
-            # 训练判别器
+            # ── 训练判别器 ──────────────────────────────────────────
+            # D 不用 DDP 包裹，手动 all-reduce 梯度（避免 GAN 交替训练的 unused params 问题）
             optimizer_D.zero_grad()
-            gen_out = G(Iin)
-            Icomp   = gen_out[-1]
-            real_g, real_l = D(Igt, Mb_gt)
-            fake_g, fake_l = D(Icomp.detach(), Mb_gt)
-            loss_D = (EnsExamLoss.hinge_loss_D(real_g, fake_g)
-                      + EnsExamLoss.hinge_loss_D(real_l, fake_l)) / 2
+            with torch.no_grad():
+                gen_out = unwrap_model(G)(Iin)
+            Icomp = gen_out[-1]
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                real_g, real_l = D(Igt,   Mb_gt)
+                fake_g, fake_l = D(Icomp, Mb_gt)
+                loss_D = (EnsExamLoss.hinge_loss_D(real_g, fake_g)
+                          + EnsExamLoss.hinge_loss_D(real_l, fake_l)) / 2
             loss_D.backward()
+            if is_ddp():
+                ws = get_world_size()
+                for p in D.parameters():
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                        p.grad.div_(ws)
             optimizer_D.step()
 
-            # 训练生成器
+            # ── 训练生成器 ──────────────────────────────────────────
+            # G 通过 DDP 正常 forward/backward（DDP 自动 allreduce G 的梯度）
+            # D 不在 DDP 中，backward 流过 D 但 D 的梯度不需要同步
             optimizer_G.zero_grad()
-            fake_g, fake_l = D(Icomp, Mb_gt)
-            loss_G, parts  = criterion(gen_out, gt, (fake_g, fake_l))
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
+                gen_out = G(Iin)
+                Icomp   = gen_out[-1]
+                fake_g, fake_l = D(Icomp, Mb_gt)
+                loss_G, parts  = criterion(gen_out, gt, (fake_g, fake_l))
             loss_G.backward()
             optimizer_G.step()
 
-            epoch_loss_G += loss_G.item()
-            epoch_loss_D += loss_D.item()
-            for i, p in enumerate(parts):
-                epoch_parts[i] += p.item()
+            # GPU 上累加，不触发 sync
+            sum_loss_G += loss_G.detach()
+            sum_loss_D += loss_D.detach()
+            for i in range(len(parts)):
+                sum_parts[i] += parts[i].detach()
+            n_steps += 1
 
-            pbar.set_postfix({
-                'D':   f"{loss_D.item():.3f}",
-                'G':   f"{loss_G.item():.3f}",
-                'adv': f"{parts[0].item():.3f}",
-                'lr':  f"{parts[1].item():.3f}",
-            })
+            # 进度条：每 20 步更新一次（减少 .item() sync 频率）
+            if n_steps % 20 == 0:
+                pbar.set_postfix({
+                    'D':   f"{(sum_loss_D.item() / n_steps):.3f}",
+                    'G':   f"{(sum_loss_G.item() / n_steps):.3f}",
+                })
 
-        # epoch 平均
-        n = len(train_loader)
-        avg_G  = epoch_loss_G / n
-        avg_D  = epoch_loss_D / n
-        avg_parts = [p / n for p in epoch_parts]
+        # epoch 平均（此处一次性 .item()，可接受）
+        n = max(n_steps, 1)
+        avg_G  = sum_loss_G.item() / n
+        avg_D  = sum_loss_D.item() / n
+        avg_parts = [sum_parts[i].item() / n for i in range(6)]
 
         # 验证
         val_m = validate(G, val_loader, device)
@@ -660,10 +700,6 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
                         wandb.run.summary['best_epoch'] = epoch + 1
             if should_stop:
                 break
-
-        # DDP barrier：确保所有 rank 同步到这里再进入下一个 epoch
-        if is_ddp():
-            dist.barrier()
 
     if wb_run is not None:
         wandb.finish()

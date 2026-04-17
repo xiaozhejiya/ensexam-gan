@@ -70,7 +70,7 @@ class ReptileMetaLearner:
                 batch = next(loader_iter)
 
             Iin, Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt = [
-                t.to(self.device) for t in batch
+                t.to(self.device, non_blocking=True) for t in batch
             ]
             gt = (Ms_gt, Mb_gt, Igt4, Igt2, Igt1, Igt)
 
