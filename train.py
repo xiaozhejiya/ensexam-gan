@@ -701,6 +701,70 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
             if should_stop:
                 break
 
+    # ── 训练结束后，在测试集上评估最优模型 ─────────────────────────────────────
+    if is_main_process():
+        logger.info("=" * 60)
+        logger.info("训练结束，开始在测试集上评估最优模型...")
+
+        # 加载最优权重（best.pth）；若不存在则使用 latest.pth
+        best_path   = os.path.join(run_dir, 'best.pth')
+        latest_path = os.path.join(run_dir, 'latest.pth')
+        eval_ckpt_path = best_path if os.path.exists(best_path) else latest_path
+
+        if os.path.exists(eval_ckpt_path):
+            eval_ckpt = torch.load(eval_ckpt_path, map_location=device, weights_only=False)
+            unwrap_model(G).load_state_dict(eval_ckpt['G_state_dict'])
+            eval_epoch = eval_ckpt.get('epoch', '?')
+            logger.info(f"已加载权重：{eval_ckpt_path}（epoch={eval_epoch}）")
+        else:
+            logger.warning("未找到保存的权重文件，使用当前模型状态进行测试集评估")
+
+        # 构建测试集（始终使用 test/ 目录，无数据增强）
+        test_dataset = EnsExamRealDataset(
+            data_root=data_root, img_size=img_size, is_train=False,
+            overlap=0, mask_threshold=mask_threshold, aug_cfg=None, phase='test',
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, drop_last=False, pin_memory=pin,
+            persistent_workers=(num_workers > 0),
+            prefetch_factor=(2 if num_workers > 0 else None),
+        )
+        logger.info(f"测试集：{len(test_dataset)} patches")
+
+        # 评估
+        test_m = validate(unwrap_model(G), test_loader, device)
+
+        logger.info("-" * 60)
+        logger.info("测试集评估结果：")
+        logger.info(f"  PSNR     = {test_m['psnr']:.4f}")
+        logger.info(f"  MS-SSIM  = {test_m['ms_ssim']:.4f}")
+        logger.info(f"  MSE      = {test_m['mse']:.6f}")
+        logger.info(f"  L1       = {test_m['l1']:.6f}")
+        logger.info(f"  AGE      = {test_m['age']:.4f}")
+        logger.info(f"  pEPs     = {test_m['peps']:.4f}")
+        logger.info(f"  pCEPs    = {test_m['pceps']:.4f}")
+        logger.info("=" * 60)
+
+        # W&B 上报测试集指标
+        if wb_run is not None:
+            wandb.log({
+                'test/psnr':    test_m['psnr'],
+                'test/ms_ssim': test_m['ms_ssim'],
+                'test/mse':     test_m['mse'],
+                'test/l1':      test_m['l1'],
+                'test/age':     test_m['age'],
+                'test/peps':    test_m['peps'],
+                'test/pceps':   test_m['pceps'],
+            })
+            wandb.run.summary['test_psnr']    = test_m['psnr']
+            wandb.run.summary['test_ms_ssim'] = test_m['ms_ssim']
+            wandb.run.summary['test_mse']     = test_m['mse']
+            wandb.run.summary['test_l1']      = test_m['l1']
+            wandb.run.summary['test_age']     = test_m['age']
+            wandb.run.summary['test_peps']    = test_m['peps']
+            wandb.run.summary['test_pceps']   = test_m['pceps']
+
     if wb_run is not None:
         wandb.finish()
     cleanup_ddp()
