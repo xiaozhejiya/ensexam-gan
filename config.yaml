@@ -114,6 +114,16 @@ data:
           min_area: 300             # 词组最小面积，过滤标点噪声
           text_threshold: 180       # 印刷字阈值，越大覆盖越多
 
+# ── 推理预处理 ────────────────────────────────────────────────────────────────
+inference:
+  auto_scale:
+    enabled: true                  # 总开关：false 时保持原始推理流程，方便 A/B 对比
+    reference_text_height: 16.0    # 基于 train/all_labels 全量 430 张 GT 图统计得到的中位文字高度（px）
+    trigger_ratio: 1.05            # 当前页估计文字高度偏离参考尺度超过该比例时才触发自动缩放
+    min_scale: 0.5                 # 最多缩小到原图的 50%
+    max_scale: 1.5                 # >1.0 时允许自动放大偏小页面
+    min_components: 30             # 至少需要这么多候选连通域才认为尺度估计可靠
+
 # ── 早停 ───────────────────────────────────────────────────────────────────────
 early_stopping:
   enabled: true
