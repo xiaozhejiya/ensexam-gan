@@ -212,7 +212,7 @@ def main():
         if eval_mode == 'both' and args.save_images:
             page_save_dir = os.path.join(args.output_dir, 'pages')
             os.makedirs(page_save_dir, exist_ok=True)
-        print(f"    [page] 开始整页评估（overlap={page_overlap}px）...")
+        print(f"    [page] 开始整页评估（overlap={page_overlap}px，tile_batch={batch_size}）...")
         page_metrics, page_count = evaluate_full_pages(
             G,
             data_root=data_root,
@@ -220,6 +220,9 @@ def main():
             phase='test',
             overlap=page_overlap,
             save_dir=page_save_dir,
+            metric_device=device,
+            infer_batch_size=batch_size,
+            verbose=True,
         )
 
     # ── 输出结果 ──────────────────────────────────────────────────────────

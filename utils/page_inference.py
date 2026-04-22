@@ -24,6 +24,16 @@ def _mask_to_uint8(tensor: torch.Tensor) -> np.ndarray:
     return np.clip(arr * 255, 0, 255).astype(np.uint8)
 
 
+def _batch_image_to_uint8(tensor: torch.Tensor) -> np.ndarray:
+    arr = tensor.detach().cpu().permute(0, 2, 3, 1).numpy()
+    return np.clip((arr + 1.0) * 127.5, 0, 255).astype(np.uint8)
+
+
+def _batch_mask_to_uint8(tensor: torch.Tensor) -> np.ndarray:
+    arr = tensor.detach().cpu().squeeze(1).numpy()
+    return np.clip(arr * 255, 0, 255).astype(np.uint8)
+
+
 def ticks(total: int, patch_size: int, stride: int):
     if total <= patch_size:
         return [0]
@@ -40,11 +50,13 @@ def infer_full_page(generator: torch.nn.Module,
                     device: torch.device,
                     patch_size: int = 512,
                     overlap: int = 32,
+                    batch_size: int = 1,
                     progress_callback: Optional[Callable[[int, int], None]] = None) -> Dict[str, np.ndarray]:
     """对整页 RGB 图像执行滑窗推理与 overlap 融合。"""
     arr = _normalize_rgb(rgb)
     height, width, _ = arr.shape
     stride = max(patch_size - overlap, 1)
+    batch_size = max(int(batch_size), 1)
 
     result = np.zeros((height, width, 3), dtype=np.float64)
     ic1_map = np.zeros((height, width, 3), dtype=np.float64)
@@ -57,6 +69,36 @@ def infer_full_page(generator: torch.nn.Module,
     total = len(ys) * len(xs)
     done = 0
 
+    pending_patches = []
+    pending_meta = []
+
+    def flush_pending() -> None:
+        nonlocal done
+        if not pending_patches:
+            return
+
+        patch_batch = np.stack(pending_patches, axis=0)
+        patch_tensor = torch.from_numpy(patch_batch).permute(0, 3, 1, 2).to(device)
+        ms, mb, _ic4, _ic2, ic1, _ire, icomp = generator(patch_tensor)
+        icomp_batch = _batch_image_to_uint8(icomp)
+        ic1_batch = _batch_image_to_uint8(ic1)
+        ms_batch = _batch_mask_to_uint8(ms)
+        mb_batch = _batch_mask_to_uint8(mb)
+
+        for index, (y, x, patch_h, patch_w) in enumerate(pending_meta):
+            result[y:y + patch_h, x:x + patch_w] += icomp_batch[index, :patch_h, :patch_w].astype(np.float64)
+            ic1_map[y:y + patch_h, x:x + patch_w] += ic1_batch[index, :patch_h, :patch_w].astype(np.float64)
+            ms_map[y:y + patch_h, x:x + patch_w] += ms_batch[index, :patch_h, :patch_w].astype(np.float64)
+            mb_map[y:y + patch_h, x:x + patch_w] += mb_batch[index, :patch_h, :patch_w].astype(np.float64)
+            weight[y:y + patch_h, x:x + patch_w] += 1.0
+            done += 1
+
+            if progress_callback is not None:
+                progress_callback(done, total)
+
+        pending_patches.clear()
+        pending_meta.clear()
+
     for y in ys:
         for x in xs:
             patch_arr = arr[y:y + patch_size, x:x + patch_size]
@@ -67,22 +109,12 @@ def infer_full_page(generator: torch.nn.Module,
                 patch_canvas[:patch_h, :patch_w] = patch_arr
                 patch_arr = patch_canvas
 
-            patch_tensor = _to_tensor(patch_arr, device)
-            ms, mb, _ic4, _ic2, ic1, _ire, icomp = generator(patch_tensor)
-            icomp_patch = _image_to_uint8(icomp)[:patch_h, :patch_w].astype(np.float64)
-            ic1_patch = _image_to_uint8(ic1)[:patch_h, :patch_w].astype(np.float64)
-            ms_patch = _mask_to_uint8(ms)[:patch_h, :patch_w].astype(np.float64)
-            mb_patch = _mask_to_uint8(mb)[:patch_h, :patch_w].astype(np.float64)
+            pending_patches.append(patch_arr)
+            pending_meta.append((y, x, patch_h, patch_w))
+            if len(pending_patches) >= batch_size:
+                flush_pending()
 
-            result[y:y + patch_h, x:x + patch_w] += icomp_patch
-            ic1_map[y:y + patch_h, x:x + patch_w] += ic1_patch
-            ms_map[y:y + patch_h, x:x + patch_w] += ms_patch
-            mb_map[y:y + patch_h, x:x + patch_w] += mb_patch
-            weight[y:y + patch_h, x:x + patch_w] += 1.0
-            done += 1
-
-            if progress_callback is not None:
-                progress_callback(done, total)
+    flush_pending()
 
     weight_rgb = weight[:, :, np.newaxis]
     return {

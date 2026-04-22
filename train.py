@@ -723,13 +723,15 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
             patch_test_m = validate(unwrap_model(G), test_loader, device)
 
         if final_test_mode in ('page', 'both'):
-            logger.info(f"Page 测试集：整页评估，overlap={page_overlap}px")
+            logger.info(f"Page 测试集：整页评估，overlap={page_overlap}px，tile_batch={batch_size}")
             page_test_m, page_count = evaluate_full_pages(
                 unwrap_model(G),
                 data_root=data_root,
                 device=device,
                 phase='test',
                 overlap=page_overlap,
+                metric_device=device,
+                infer_batch_size=batch_size,
             )
 
         logger.info("-" * 60)
