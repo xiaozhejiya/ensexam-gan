@@ -208,11 +208,31 @@ python train.py --config my_config.yaml
 > **多卡说明**：DDP 模式由 `torchrun` 自动管理进程，`config.yaml` 中的 `gpu_ids`
 > 字段在 DDP 模式下会被 `LOCAL_RANK` 环境变量覆盖，**无需手动修改**。
 
+### 第 4 步：测试与评估
+
+```bash
+# 同时输出 patch 级与 page 级结果（默认 both）
+python test.py --weights checkpoints/ensexam/best.pth
+
+# 只看 patch 级结果
+python test.py --weights checkpoints/ensexam/best.pth --eval-mode patch
+
+# 只看整页重建后的结果，并指定 overlap
+python test.py --weights checkpoints/ensexam/best.pth --eval-mode page --page-overlap 32
+```
+
+评估输出现在同时保留两种口径：
+
+- raw：代码真实计算值，例如 `MS-SSIM=0.9842`、`MSE=0.000443`
+- paper：便于和论文表格直接对照的展示值，例如 `MS-SSIM=98.42`、`MSE=0.0443`
+
+训练过程中的每个 epoch 验证与早停仍使用 patch 级评估，以保持速度和 best checkpoint 选择逻辑稳定；训练结束后的最终测试可按 `evaluation.final_test_mode` 同时输出 patch/page 两套结果。
+
 **训练产物：**
 
 | 文件 | 说明 |
 |------|------|
-| `ensexam_checkpoints/best.pth` | 验证集 loss 最优权重 |
+| `ensexam_checkpoints/best.pth` | 验证集 PSNR 最优权重 |
 | `ensexam_checkpoints/latest.pth` | 最新权重（断点续训）|
 | `ensexam_checkpoints/epoch_N.pth` | 定期快照 |
 | `logs/train_YYYYMMDD.log` | 完整文本日志 |
@@ -239,6 +259,7 @@ python train.py  # config.yaml 中 wandb.enabled=true 时自动上传
 | `loss` | LR / 感知 / 风格 / SN / Block 损失权重 |
 | `train` | epochs、lr、batch_size、Adam betas、断点续训 |
 | `data` | 数据集路径、裁剪尺寸、掩码阈值、数据增强概率 |
+| `evaluation` | test.py / train.py 最终测试的 patch/page 模式与 page overlap |
 | `early_stopping` | patience、min_delta |
 | `reptile` | meta_epochs、inner_lr、meta_lr、n_tasks_per_episode |
 | `tuning` | Optuna 搜索空间、trial 数、SQLite 路径 |

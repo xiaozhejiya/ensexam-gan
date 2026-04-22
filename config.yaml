@@ -124,6 +124,12 @@ inference:
     max_scale: 1.5                 # >1.0 时允许自动放大偏小页面
     min_components: 30             # 至少需要这么多候选连通域才认为尺度估计可靠
 
+# ── 评估与展示 ────────────────────────────────────────────────────────────────
+evaluation:
+  standalone_test_mode: both      # test.py 默认模式：patch / page / both
+  final_test_mode: both           # train.py 训练结束后的最终测试模式：patch / page / both
+  page_overlap: 32                # 整页评估滑窗重叠像素；越大越平滑，但推理更慢
+
 # ── 早停 ───────────────────────────────────────────────────────────────────────
 early_stopping:
   enabled: true

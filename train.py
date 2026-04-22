@@ -12,22 +12,18 @@
 import argparse
 import csv
 import logging
-import math
 import os
 import random
 import sys
 from datetime import datetime
 
-import cv2
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import numpy as np
-from pytorch_msssim import ms_ssim as compute_ms_ssim
 from torch import optim
 from tqdm import tqdm
 
@@ -42,6 +38,16 @@ from data.dataset import EnsExamRealDataset
 from losses.losses import EnsExamLoss
 from networks.discriminator import Discriminator
 from networks.generator import Generator
+from utils.eval_metrics import (
+    compute_batch_metric_sums,
+    finalize_metric_sums,
+    format_metric_block,
+    init_metric_sums,
+    merge_metric_sums,
+    paper_display_metrics,
+    to_unit_interval,
+)
+from utils.page_eval import evaluate_full_pages
 from utils.path_utils import normalize_path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -284,8 +290,6 @@ def log_images_to_wandb(G, val_loader, device, epoch):
 
 # ── 验证循环 ───────────────────────────────────────────────────────────────────
 
-_CROSS_KERNEL = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
-
 
 @torch.no_grad()
 def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> dict:
@@ -294,53 +298,21 @@ def validate(G: Generator, val_loader: DataLoader, device: torch.device) -> dict
       PSNR、MS-SSIM、MSE、L1、AGE、pEPs、pCEPs
     """
     G.eval()
-    sums = {'psnr': 0.0, 'ms_ssim': 0.0, 'mse': 0.0,
-            'l1': 0.0, 'age': 0.0, 'peps': 0.0, 'pceps': 0.0}
-    n_batches = 0
-    n_images  = 0
+    sums = init_metric_sums()
+    n_images = 0
 
     for Iin, _, _, _, _, _, Igt in val_loader:
         Iin, Igt = Iin.to(device), Igt.to(device)
         *_, Icomp = G(Iin)
 
         # [-1,1] → [0,1]
-        pred = (Icomp.clamp(-1, 1) + 1) / 2
-        gt   = (Igt.clamp(-1, 1) + 1) / 2
-
-        # ── 批量指标 ──────────────────────────────────────────────
-        mse_val = F.mse_loss(pred, gt).item()
-        sums['mse']     += mse_val
-        sums['l1']      += F.l1_loss(pred, gt).item()
-        sums['psnr']    += (10 * math.log10(1.0 / mse_val) if mse_val > 1e-10 else 100.0)
-        sums['ms_ssim'] += compute_ms_ssim(pred, gt, data_range=1.0).item()
-
-        # ── 逐图灰度指标：AGE / pEPs / pCEPs ─────────────────────
-        pred_np = (pred.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-        gt_np   = (gt.cpu().numpy().transpose(0, 2, 3, 1) * 255).astype(np.uint8)
-
-        for b in range(pred_np.shape[0]):
-            pred_g = cv2.cvtColor(pred_np[b], cv2.COLOR_RGB2GRAY).astype(np.int16)
-            gt_g   = cv2.cvtColor(gt_np[b],   cv2.COLOR_RGB2GRAY).astype(np.int16)
-            diff   = np.abs(pred_g - gt_g)
-
-            sums['age']  += diff.mean()
-            err_mask      = (diff > 20).astype(np.uint8)
-            sums['peps'] += err_mask.mean()
-            sums['pceps'] += cv2.erode(err_mask, _CROSS_KERNEL, iterations=1).mean()
-
-        n_batches += 1
-        n_images  += pred_np.shape[0]
+        pred = to_unit_interval(Icomp)
+        gt = to_unit_interval(Igt)
+        merge_metric_sums(sums, compute_batch_metric_sums(pred, gt))
+        n_images += pred.shape[0]
 
     G.train()
-    return {
-        'psnr':    sums['psnr']    / n_batches,
-        'ms_ssim': sums['ms_ssim'] / n_batches,
-        'mse':     sums['mse']     / n_batches,
-        'l1':      sums['l1']      / n_batches,
-        'age':     sums['age']     / n_images,
-        'peps':    sums['peps']    / n_images,
-        'pceps':   sums['pceps']   / n_images,
-    }
+    return finalize_metric_sums(sums, n_images)
 
 
 # ── 主训练函数 ─────────────────────────────────────────────────────────────────
@@ -351,6 +323,7 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
 
     train_cfg = cfg['train']
     data_cfg  = cfg['data']
+    eval_cfg  = cfg.get('evaluation', {})
     es_cfg    = cfg.get('early_stopping', {})
 
     epochs      = train_cfg['epochs']
@@ -369,6 +342,10 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
     img_size       = data_cfg['img_size']
     overlap        = data_cfg['overlap']
     mask_threshold = data_cfg['mask_threshold']
+    final_test_mode = eval_cfg.get('final_test_mode', 'both')
+    page_overlap = int(eval_cfg.get('page_overlap', 32))
+    if final_test_mode not in {'patch', 'page', 'both'}:
+        raise ValueError(f'未知 final_test_mode: {final_test_mode}')
 
     # 创建本次运行目录（权重 / 日志 / config 快照统一存放）
     if run_dir is None:
@@ -619,6 +596,7 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         best_val_loss = min(best_val_loss, val_m['l1'])
 
         current_lr = optimizer_G.param_groups[0]['lr']
+        val_display = paper_display_metrics(val_m)
 
         # 只在 rank 0 上做日志 / CSV / W&B / checkpoint
         if is_main_process():
@@ -627,9 +605,12 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
                 f"Train G={avg_G:.4f}  D={avg_D:.4f} | "
                 f"adv={avg_parts[0]:.4f}  rec={avg_parts[1]:.4f}  "
                 f"per={avg_parts[2]:.4f}  style={avg_parts[3]:.4f} | "
-                f"PSNR={val_m['psnr']:.2f}  MS-SSIM={val_m['ms_ssim']:.4f}  "
-                f"MSE={val_m['mse']:.6f}  AGE={val_m['age']:.2f}  "
-                f"pEPs={val_m['peps']:.4f}  pCEPs={val_m['pceps']:.4f} | "
+                f"PSNR={val_m['psnr']:.2f}  "
+                f"MS-SSIM={val_display['ms_ssim']:.2f}({val_m['ms_ssim']:.4f})  "
+                f"MSE={val_display['mse']:.4f}({val_m['mse']:.6f})  "
+                f"AGE={val_m['age']:.2f}  "
+                f"pEPs={val_display['peps']:.2f}({val_m['peps']:.4f})  "
+                f"pCEPs={val_display['pceps']:.2f}({val_m['pceps']:.4f}) | "
                 f"LR={current_lr:.2e}"
             )
             csv_log.write(epoch + 1, avg_G, avg_D, avg_parts, val_m['l1'])
@@ -652,6 +633,10 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
                     'val/age':          val_m['age'],
                     'val/peps':         val_m['peps'],
                     'val/pceps':        val_m['pceps'],
+                    'val_display/ms_ssim_x100': val_display['ms_ssim'],
+                    'val_display/mse_x100':     val_display['mse'],
+                    'val_display/peps_x100':    val_display['peps'],
+                    'val_display/pceps_x100':   val_display['pceps'],
                     'train/lr':         current_lr,
                 }, step=epoch + 1)
                 # 每隔 N epoch 上传对比图
@@ -719,51 +704,96 @@ def train_ensexam(cfg: dict, run_dir: str = None, phase: str = 'train') -> float
         else:
             logger.warning("未找到保存的权重文件，使用当前模型状态进行测试集评估")
 
-        # 构建测试集（始终使用 test/ 目录，无数据增强）
-        test_dataset = EnsExamRealDataset(
-            data_root=data_root, img_size=img_size, is_train=False,
-            overlap=0, mask_threshold=mask_threshold, aug_cfg=None, phase='test',
-        )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, drop_last=False, pin_memory=pin,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=(2 if num_workers > 0 else None),
-        )
-        logger.info(f"测试集：{len(test_dataset)} patches")
+        patch_test_m = None
+        page_test_m = None
+        page_count = 0
 
-        # 评估
-        test_m = validate(unwrap_model(G), test_loader, device)
+        if final_test_mode in ('patch', 'both'):
+            test_dataset = EnsExamRealDataset(
+                data_root=data_root, img_size=img_size, is_train=False,
+                overlap=0, mask_threshold=mask_threshold, aug_cfg=None, phase='test',
+            )
+            test_loader = DataLoader(
+                test_dataset, batch_size=batch_size, shuffle=False,
+                num_workers=num_workers, drop_last=False, pin_memory=pin,
+                persistent_workers=(num_workers > 0),
+                prefetch_factor=(2 if num_workers > 0 else None),
+            )
+            logger.info(f"Patch 测试集：{len(test_dataset)} patches")
+            patch_test_m = validate(unwrap_model(G), test_loader, device)
+
+        if final_test_mode in ('page', 'both'):
+            logger.info(f"Page 测试集：整页评估，overlap={page_overlap}px")
+            page_test_m, page_count = evaluate_full_pages(
+                unwrap_model(G),
+                data_root=data_root,
+                device=device,
+                phase='test',
+                overlap=page_overlap,
+            )
 
         logger.info("-" * 60)
-        logger.info("测试集评估结果：")
-        logger.info(f"  PSNR     = {test_m['psnr']:.4f}")
-        logger.info(f"  MS-SSIM  = {test_m['ms_ssim']:.4f}")
-        logger.info(f"  MSE      = {test_m['mse']:.6f}")
-        logger.info(f"  L1       = {test_m['l1']:.6f}")
-        logger.info(f"  AGE      = {test_m['age']:.4f}")
-        logger.info(f"  pEPs     = {test_m['peps']:.4f}")
-        logger.info(f"  pCEPs    = {test_m['pceps']:.4f}")
+        if patch_test_m is not None:
+            logger.info("Patch 级测试集评估结果：")
+            for line in format_metric_block(patch_test_m):
+                logger.info(line)
+        if page_test_m is not None:
+            logger.info(f"Page 级测试集评估结果（{page_count} 张整页）：")
+            for line in format_metric_block(page_test_m):
+                logger.info(line)
         logger.info("=" * 60)
 
         # W&B 上报测试集指标
         if wb_run is not None:
-            wandb.log({
-                'test/psnr':    test_m['psnr'],
-                'test/ms_ssim': test_m['ms_ssim'],
-                'test/mse':     test_m['mse'],
-                'test/l1':      test_m['l1'],
-                'test/age':     test_m['age'],
-                'test/peps':    test_m['peps'],
-                'test/pceps':   test_m['pceps'],
-            })
-            wandb.run.summary['test_psnr']    = test_m['psnr']
-            wandb.run.summary['test_ms_ssim'] = test_m['ms_ssim']
-            wandb.run.summary['test_mse']     = test_m['mse']
-            wandb.run.summary['test_l1']      = test_m['l1']
-            wandb.run.summary['test_age']     = test_m['age']
-            wandb.run.summary['test_peps']    = test_m['peps']
-            wandb.run.summary['test_pceps']   = test_m['pceps']
+            wandb_payload = {}
+            if patch_test_m is not None:
+                test_display = paper_display_metrics(patch_test_m)
+                wandb_payload.update({
+                    'test/psnr':    patch_test_m['psnr'],
+                    'test/ms_ssim': patch_test_m['ms_ssim'],
+                    'test/mse':     patch_test_m['mse'],
+                    'test/l1':      patch_test_m['l1'],
+                    'test/age':     patch_test_m['age'],
+                    'test/peps':    patch_test_m['peps'],
+                    'test/pceps':   patch_test_m['pceps'],
+                    'test_display/ms_ssim_x100': test_display['ms_ssim'],
+                    'test_display/mse_x100':     test_display['mse'],
+                    'test_display/peps_x100':    test_display['peps'],
+                    'test_display/pceps_x100':   test_display['pceps'],
+                })
+                wandb.run.summary['test_psnr'] = patch_test_m['psnr']
+                wandb.run.summary['test_ms_ssim'] = patch_test_m['ms_ssim']
+                wandb.run.summary['test_mse'] = patch_test_m['mse']
+                wandb.run.summary['test_l1'] = patch_test_m['l1']
+                wandb.run.summary['test_age'] = patch_test_m['age']
+                wandb.run.summary['test_peps'] = patch_test_m['peps']
+                wandb.run.summary['test_pceps'] = patch_test_m['pceps']
+
+            if page_test_m is not None:
+                page_display = paper_display_metrics(page_test_m)
+                wandb_payload.update({
+                    'test_page/psnr':    page_test_m['psnr'],
+                    'test_page/ms_ssim': page_test_m['ms_ssim'],
+                    'test_page/mse':     page_test_m['mse'],
+                    'test_page/l1':      page_test_m['l1'],
+                    'test_page/age':     page_test_m['age'],
+                    'test_page/peps':    page_test_m['peps'],
+                    'test_page/pceps':   page_test_m['pceps'],
+                    'test_page_display/ms_ssim_x100': page_display['ms_ssim'],
+                    'test_page_display/mse_x100':     page_display['mse'],
+                    'test_page_display/peps_x100':    page_display['peps'],
+                    'test_page_display/pceps_x100':   page_display['pceps'],
+                })
+                wandb.run.summary['test_page_psnr'] = page_test_m['psnr']
+                wandb.run.summary['test_page_ms_ssim'] = page_test_m['ms_ssim']
+                wandb.run.summary['test_page_mse'] = page_test_m['mse']
+                wandb.run.summary['test_page_l1'] = page_test_m['l1']
+                wandb.run.summary['test_page_age'] = page_test_m['age']
+                wandb.run.summary['test_page_peps'] = page_test_m['peps']
+                wandb.run.summary['test_page_pceps'] = page_test_m['pceps']
+
+            if wandb_payload:
+                wandb.log(wandb_payload)
 
     if wb_run is not None:
         wandb.finish()

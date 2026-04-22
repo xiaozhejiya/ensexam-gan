@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config_loader import load_config
 from networks.generator import Generator
+from utils.page_inference import infer_full_page
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="EnsExam-GAN 擦除推理")
@@ -210,13 +211,6 @@ def compute_auto_scale(rgb: np.ndarray, scale_cfg: dict) -> dict:
     return scale_info
 
 
-def preprocess(rgb: np.ndarray):
-    """RGB 归一化到 [-1, 1]。边缘 patch 在 infer 中按需局部 padding。"""
-    orig_h, orig_w = rgb.shape[:2]
-    arr = rgb.astype(np.float32) / 127.5 - 1.0
-    return arr, orig_w, orig_h
-
-
 def maybe_apply_auto_scale(pil_img: Image.Image):
     rgb = np.array(pil_img.convert("RGB"), dtype=np.uint8)
     scale_info = {
@@ -242,81 +236,6 @@ def maybe_apply_auto_scale(pil_img: Image.Image):
     scale_info["resized_width"] = resized_w
     scale_info["resized_height"] = resized_h
     return resized, scale_info
-
-
-def to_tensor(arr: np.ndarray) -> torch.Tensor:
-    return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
-
-
-def to_numpy(t: torch.Tensor) -> np.ndarray:
-    arr = t.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    return np.clip((arr + 1.0) * 127.5, 0, 255).astype(np.uint8)
-
-
-def ticks(total: int, patch: int, stride: int):
-    if total <= patch:
-        return [0]
-
-    pts = list(range(0, total - patch + 1, stride))
-    if not pts or pts[-1] + patch < total:
-        pts.append(total - patch)
-    return pts
-
-
-def mask_to_numpy(t: torch.Tensor) -> np.ndarray:
-    """将单通道掩码 tensor [0,1] 转为 uint8 灰度图。"""
-    arr = t.squeeze(0).squeeze(0).cpu().numpy()
-    return np.clip(arr * 255, 0, 255).astype(np.uint8)
-
-
-def infer(arr: np.ndarray):
-    h, w, _ = arr.shape
-    stride = PATCH - OVERLAP
-    result  = np.zeros((h, w, 3), dtype=np.float64)
-    ic1_map = np.zeros((h, w, 3), dtype=np.float64)
-    ms_map  = np.zeros((h, w),    dtype=np.float64)
-    mb_map  = np.zeros((h, w),    dtype=np.float64)
-    weight  = np.zeros((h, w),    dtype=np.float64)
-
-    ys = ticks(h, PATCH, stride)
-    xs = ticks(w, PATCH, stride)
-    total = len(ys) * len(xs)
-    done = 0
-
-    with torch.no_grad():
-        for y in ys:
-            for x in xs:
-                patch_arr = arr[y:y + PATCH, x:x + PATCH]
-                patch_h, patch_w = patch_arr.shape[:2]
-
-                if patch_h != PATCH or patch_w != PATCH:
-                    patch_canvas = np.ones((PATCH, PATCH, 3), dtype=np.float32)
-                    patch_canvas[:patch_h, :patch_w] = patch_arr
-                    patch_arr = patch_canvas
-
-                patch_tensor = to_tensor(patch_arr)
-                # Generator 返回: Ms, Mb, Ic4, Ic2, Ic1, Ire, Icomp
-                Ms, Mb, _Ic4, _Ic2, Ic1, _Ire, Icomp = G(patch_tensor)
-                icomp_patch = to_numpy(Icomp)[:patch_h, :patch_w].astype(np.float64)
-                ic1_patch = to_numpy(Ic1)[:patch_h, :patch_w].astype(np.float64)
-                ms_patch = mask_to_numpy(Ms)[:patch_h, :patch_w].astype(np.float64)
-                mb_patch = mask_to_numpy(Mb)[:patch_h, :patch_w].astype(np.float64)
-
-                result[y:y + patch_h, x:x + patch_w]  += icomp_patch
-                ic1_map[y:y + patch_h, x:x + patch_w] += ic1_patch
-                ms_map[y:y + patch_h, x:x + patch_w]  += ms_patch
-                mb_map[y:y + patch_h, x:x + patch_w]  += mb_patch
-                weight[y:y + patch_h, x:x + patch_w] += 1.0
-                done += 1
-                print(f"    patch {done}/{total}", end="\r")
-
-    print()
-    w3    = weight[:, :, np.newaxis]
-    icomp = np.clip(result  / w3, 0, 255).astype(np.uint8)
-    ic1   = np.clip(ic1_map / w3, 0, 255).astype(np.uint8)
-    ms    = np.clip(ms_map  / weight, 0, 255).astype(np.uint8)
-    mb    = np.clip(mb_map  / weight, 0, 255).astype(np.uint8)
-    return icomp, ic1, ms, mb
 
 
 # ── 执行推理 ──────────────────────────────────────────────────────────────────
@@ -366,16 +285,24 @@ else:
             print(f"    状态: 未缩放（原因: {scale_info.get('reason')}）")
     print(f"    尺度处理后尺寸: {inference_rgb.shape[1]}x{inference_rgb.shape[0]}")
 
-arr, proc_w, proc_h = preprocess(inference_rgb)
+proc_h, proc_w = inference_rgb.shape[:2]
 print(f"    推理尺寸: {proc_w}x{proc_h}")
 print(f"    全图不做补边，边缘 patch 按需补齐到 {PATCH}x{PATCH}  重叠: {OVERLAP}px")
 
 print("\n[4] 开始推理...")
-result_arr, ic1_arr, ms_arr, mb_arr = infer(arr)
-result_arr = result_arr[:proc_h, :proc_w]
-ic1_arr    = ic1_arr[:proc_h, :proc_w]
-ms_arr     = ms_arr[:proc_h, :proc_w]
-mb_arr     = mb_arr[:proc_h, :proc_w]
+outputs = infer_full_page(
+    G,
+    inference_rgb,
+    device,
+    patch_size=PATCH,
+    overlap=OVERLAP,
+    progress_callback=lambda done, total: print(f"    patch {done}/{total}", end="\r"),
+)
+print()
+result_arr = outputs['icomp'][:proc_h, :proc_w]
+ic1_arr = outputs['ic1'][:proc_h, :proc_w]
+ms_arr = outputs['ms'][:proc_h, :proc_w]
+mb_arr = outputs['mb'][:proc_h, :proc_w]
 
 if scale_info.get("applied", False):
     result_arr = cv2.resize(result_arr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
