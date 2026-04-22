@@ -8,6 +8,7 @@ ensexam_checkpoints/
 reptile_checkpoints/
 checkpoints/
 .ipynb_checkpoints/
+*.pth
 
 
 # ── 训练日志 ──────────────────────────────────────────────────────────────────
@@ -29,6 +30,7 @@ data/stroke_library/
 
 # ── Claude Code 内部状态 ───────────────────────────────────────────────────────
 .claude/
+AGENTS.md
 
 # ── 旧配置文件 ────────────────────────────────────────────────────────────────
 config.json
