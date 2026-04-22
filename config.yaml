@@ -71,7 +71,7 @@ data:
     # 2) 若希望元初始化更鲁棒，再把 meta 加入 apply_on，并适当下调 p。
     # 3) tune 阶段通常建议关闭或弱化，避免 trial 间噪声过大。
     domain_augment:
-      enabled: true                 # 总开关：false 时忽略下方全部领域增强配置
+      enabled: false                 # 总开关：false 时忽略下方全部领域增强配置
       apply_on: [train]             # 生效阶段：可选 train / meta / tune
       p: 0.7                        # 进入领域增强流水线的总概率（建议 0.4~0.8）
 
